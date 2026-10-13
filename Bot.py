@@ -668,8 +668,13 @@ async def consultar_ofertas():
 
     enlaces.sort(key=lambda elemento: 0 if titulo_interesante(elemento[1]) else 1)
     resultados = []
+    conteo_fuente = {}
+    fallos_fuente = {}
 
     for url, titulo, fuente in enlaces[:MAX_CANDIDATOS]:
+        nombre_fuente = "Sistema Nacional de Empleo" if fuente == "SEF" else urlparse(url).netloc.replace("www.", "")
+        conteo_fuente.setdefault(nombre_fuente, {"candidatos": 0, "validas": 0, "descartadas": 0, "errores": 0})
+        conteo_fuente[nombre_fuente]["candidatos"] += 1
         try:
             if fuente == "SEF":
                 oferta = await asyncio.to_thread(extraer_detalle, url, titulo)
@@ -677,9 +682,20 @@ async def consultar_ofertas():
                 oferta = await asyncio.to_thread(extraer_detalle_externo, url, titulo)
             if oferta:
                 resultados.append(oferta)
-        except Exception:
+                conteo_fuente[nombre_fuente]["validas"] += 1
+            else:
+                conteo_fuente[nombre_fuente]["descartadas"] += 1
+        except Exception as exc:
+            conteo_fuente[nombre_fuente]["errores"] += 1
+            fallos_fuente.setdefault(nombre_fuente, []).append(type(exc).__name__ + ": " + str(exc)[:100])
             logger.warning("No se pudo leer la oferta %s", url, exc_info=True)
         await asyncio.sleep(0.15)
+
+    for nombre, cuenta in conteo_fuente.items():
+        logger.info("RESULTADO FUENTE | %s | candidatos=%s válidas=%s descartadas=%s errores=%s",
+                    nombre, cuenta["candidatos"], cuenta["validas"], cuenta["descartadas"], cuenta["errores"])
+        for fallo in fallos_fuente.get(nombre, [])[:2]:
+            logger.info("ERROR FUENTE | %s | %s", nombre, fallo)
 
     unicas = {oferta["id"]: oferta for oferta in resultados}
     ofertas = list(unicas.values())
