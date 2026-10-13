@@ -630,7 +630,7 @@ def extraer_detalle_externo(url, titulo_listado):
     if "tip en vigor" in combinado:
         return None
     # El usuario tiene permiso B: no enviar puestos que exigen permisos profesionales superiores.
-    if re.search(r"carnet(?: de conducir)?\\s*(?:c\\+e|c1|c|d|adr)|permiso de conducir\\s*(?:c\\+e|c1|c|d)|carnet c\\s*\\+\\s*cap|cap en vigor", combinado):
+    if re.search(r"carnet(?: de conducir)?\s*(?:c\+e|c1|c|d|adr)|permiso de conducir\s*(?:c\+e|c1|c|d)|carnet c\s*\+\s*cap|cap en vigor", combinado):
         return None
     if re.search(r"desemplead[oa]s? de larga duracion|parad[oa]s? de larga duracion|"
                  r"estar desemplead[oa]s?|inscrit[oa]s? como demandante de empleo.{0,100}"
@@ -850,7 +850,8 @@ async def comando_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "de referencia de al menos 24.000 €/año.\n"
         "💶 Objetivo aproximado: 1.500 € netos al mes.\n"
         "🧹 Limpieza, mecánica y administración agrícola descartadas.\n"
-        "🌙 Sin ofertas que indiquen expresamente turno nocturno.\n\n"
+        "🌙 Sin ofertas que indiquen expresamente turno nocturno.\n"
+        "🌐 Búsqueda ampliada en varios portales gratuitos.\n\n"
         "/buscar - Buscar ofertas nuevas\n"
         "/preferencias - Ver filtros\n"
         "/parar - Desactivar avisos"
@@ -870,9 +871,9 @@ async def comando_buscar(update, context):
 
 async def comando_portales(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Fuente actual: Sistema Nacional de Empleo.\n\n"
-        + URL_LISTADO
-        + "\n\nEsta consulta no utiliza créditos de JOA."
+        "Fuentes gratuitas: Sistema Nacional de Empleo, Indeed, Job Today, Activa San Javier e Interempleo.\n\n"
+        "Cada oferta incluye un enlace a su página original para comprobar si sigue activa.\n\n"
+        "Esta consulta no utiliza créditos de JOA."
     )
 
 
