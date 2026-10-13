@@ -30,7 +30,7 @@ MAX_PRIMER_ENVIO = 5
 MAX_CANDIDATOS = 120
 MAX_PAGINAS = 12
 TIMEOUT_WEB = 25
-SALARIO_BRUTO_REFERENCIA = 22000
+SALARIO_BRUTO_REFERENCIA = 24000
 
 URL_LISTADO = (
     "https://www.sistemanacionalempleo.es/"
@@ -67,7 +67,7 @@ PUESTOS = [
     "controlador de accesos", "auxiliar de servicios",
     "recepcionista", "reponedor", "reponedora",
     "dependiente", "dependienta", "supermercado",
-    "mantenimiento general", "mecanico", "mecanica",
+    "mantenimiento general",
     "montador", "montadora",
 ]
 
@@ -84,13 +84,16 @@ TITULOS_EXCLUIDOS = [
     "tecnico instalador", "tecnica instaladora",
     "técnico instalador", "técnica instaladora",
     "vigilante de seguridad",
+    "mecanico", "mecanica", "mecánico", "mecánica",
 ]
 
 FRASES_NOCHE = [
     "turno de noche", "turno nocturno",
     "turno fijo de noche", "horario nocturno",
     "jornada nocturna", "solo noches",
-    "trabajo nocturno",
+    "trabajo nocturno", "turnos de noche",
+    "turno rotativo mañana tarde noche", "turno rotativo de mañana tarde y noche",
+    "disponibilidad para trabajar de noche", "disponibilidad nocturna",
 ]
 
 TAREA_AUTOMATICA = None
@@ -429,6 +432,30 @@ def motivo_descartada(titulo, texto, fin):
     if "tip en vigor" in texto_normalizado:
         return "exige TIP en vigor"
 
+    # Descartar ofertas reservadas a personas desempleadas o inscritas
+    # como demandantes de empleo, porque la persona está trabajando.
+    requisitos_desempleo = [
+        r"desemplead[oa]s? de larga duracion",
+        r"parad[oa]s? de larga duracion",
+        r"estar (?:en situacion de )?desempleo",
+        r"estar desemplead[oa]s?",
+        r"imprescindible (?:estar )?desemplead[oa]s?",
+        r"requisito.{0,80}desemplead[oa]s?",
+        r"requisito.{0,80}inscrit[oa]s? como demandante de empleo",
+        r"inscrit[oa]s? como demandante de empleo.{0,100}(?:requisito|imprescindible|obligatorio)",
+        r"(?:necesari[oa]|obligatori[oa]|imprescindible|requisito).{0,100}inscrit[oa]s? como demandante",
+        r"(?:estar|deber|tener que).{0,80}inscrit[oa]s? como demandante de empleo",
+        r"no estar trabajand[oa]",
+        r"no tener empleo",
+        r"personas desempleadas",
+        r"personas paradas de larga duracion",
+        r"inscripcion como demandante de empleo.{0,100}(?:obligatori|imprescindible|requisito)",
+    ]
+
+    for patron in requisitos_desempleo:
+        if re.search(patron, texto_normalizado, re.IGNORECASE):
+            return "exige estar desempleado/a o inscrito/a como demandante"
+
     return None
 
 
@@ -750,7 +777,7 @@ async def comando_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📍 San Javier, San Pedro del Pinatar, Los Alcázares, "
         "Torre-Pacheco y Cartagena.\n"
         "📍 Murcia capital: solo con salario bruto publicado "
-        "de referencia de al menos 22.000 €/año.\n"
+        "de referencia de al menos 24.000 €/año.\n"
         "💶 Objetivo aproximado: 1.500 € netos al mes.\n"
         "🧹 Limpieza, mecánica y administración agrícola descartadas.\n"
         "🌙 Sin ofertas que indiquen expresamente turno nocturno.\n\n"
@@ -788,12 +815,12 @@ async def comando_preferencias(
         "📍 San Javier, San Pedro del Pinatar, Los Alcázares, "
         "Torre-Pacheco y Cartagena.\n"
         "📍 Murcia capital con salario bruto publicado de referencia "
-        "de al menos 22.000 €/año.\n\n"
+        "de al menos 24.000 €/año.\n\n"
         "💶 Objetivo aproximado: 1.500 € netos al mes.\n"
         "🚚 Reparto, carnet B, furgoneta, carretilla, logística, "
         "almacén y producción.\n"
         "🏢 Conserjería y control de accesos.\n"
-        "🧹 Limpieza y administración agrícola descartadas.\n"
+        "🧹 Limpieza, mecánica y administración agrícola descartadas.\n"
         "🌙 Turnos nocturnos expresamente anunciados descartados.\n"
         "🔁 Las ofertas enviadas se guardan para evitar repeticiones.\n\n"
         "El portal puede no publicar el sueldo o el horario en todas "
