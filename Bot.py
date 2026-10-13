@@ -17,7 +17,6 @@ from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-
 # ============================================================
 # CONFIGURACION
 # ============================================================
@@ -32,6 +31,10 @@ MAX_PRIMER_ENVIO = 5
 MAX_CANDIDATOS = 120
 MAX_PAGINAS = 12
 TIMEOUT_WEB = 25
+
+# 22.000 € brutos/año es solo una referencia aproximada.
+# El neto real depende de las circunstancias personales y las pagas.
+SALARIO_BRUTO_REFERENCIA = 22000
 
 URL_LISTADO = (
     "https://www.sistemanacionalempleo.es/"
@@ -49,29 +52,43 @@ ZONAS = {
     "cartagena": "Cartagena",
 }
 
+# Puestos compatibles con la experiencia y los permisos indicados.
+# No se incluyen limpieza, soldadura ni especialidades técnicas.
 PUESTOS = [
-    "conductor", "conductora", "repartidor", "repartidora",
-    "transportista", "carretillero", "carretillera",
-    "mozo de almacen", "mozo/a de almacen", "almacenero",
-    "almacenera", "almacen", "logistica", "expediciones",
-    "encargado de almacen", "encargada de almacen",
-    "operario", "operaria", "operador de maquinaria",
-    "operador/a de maquinaria", "maquinaria agricola",
-    "produccion", "fabrica", "conserje", "control de accesos",
-    "controlador de accesos", "auxiliar de servicios",
-    "recepcionista", "mantenimiento", "reponedor", "reponedora",
-    "preparador de pedidos", "preparadora de pedidos",
-    "dependiente", "dependienta", "supermercado",
-    "limpieza", "limpiador", "limpiadora", "montador",
-    "montadora", "mecanico", "mecanica",
-    "administrativo de logistica", "administrativa de logistica",
+    "conductor", "conductora",
+    "repartidor", "repartidora",
+    "transportista",
+    "conductor de furgoneta",
+    "conductor repartidor",
+    "conductor de camion",
+    "reparto",
+    "carretillero", "carretillera",
+    "mozo de almacen", "mozo/a de almacen",
     "auxiliar de almacen", "auxiliar de almacén",
     "operario de almacen", "operario de almacén",
-    "peon", "peona", "peon de fabrica", "peon industrial",
-    "conductor de camion", "conductor de furgoneta",
-    "conductor repartidor", "reparto",
+    "almacenero", "almacenera",
+    "almacen", "logistica", "expediciones",
+    "preparador de pedidos", "preparadora de pedidos",
+    "encargado de almacen", "encargada de almacen",
+    "operario", "operaria",
+    "operario de produccion", "operaria de produccion",
+    "operador de maquinaria", "operadora de maquinaria",
+    "produccion", "fabrica", "peon industrial",
+    "peon de fabrica", "peon", "peona",
+    "conserje", "control de accesos",
+    "controlador de accesos", "auxiliar de servicios",
+    "recepcionista",
+    "reponedor", "reponedora",
+    "dependiente", "dependienta",
+    "supermercado",
+    "mantenimiento general",
+    "mecanico", "mecanica",
+    "administrativo de logistica",
+    "administrativa de logistica",
+    "montador", "montadora",
 ]
 
+# Estos términos se comprueban sobre el texto de la oferta.
 FRASES_NOCHE = [
     "turno de noche",
     "turno nocturno",
@@ -80,9 +97,11 @@ FRASES_NOCHE = [
     "jornada nocturna",
     "solo noches",
     "trabajo nocturno",
+    "turno de noche obligatorio",
 ]
 
 TAREA_AUTOMATICA = None
+BUSQUEDA_EN_CURSO = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -203,14 +222,14 @@ class LectorHTML(HTMLParser):
             self.href_actual = atributos.get("href", "")
             self.texto_enlace = []
 
-        if tag in ("br", "p", "div", "tr", "td", "li", "h1", "h2", "h3"):
+        if tag in ("br", "p", "div", "tr", "td", "li",
+                   "h1", "h2", "h3"):
             self.textos.append(" ")
 
     def handle_data(self, data):
         texto = data.strip()
         if not texto:
             return
-
         self.textos.append(texto)
         if self.href_actual is not None:
             self.texto_enlace.append(texto)
@@ -226,14 +245,13 @@ class LectorHTML(HTMLParser):
             self.href_actual = None
             self.texto_enlace = []
 
-        if tag in ("br", "p", "div", "tr", "td", "li", "h1", "h2", "h3"):
+        if tag in ("br", "p", "div", "tr", "td", "li",
+                   "h1", "h2", "h3"):
             self.textos.append(" ")
 
     def texto_completo(self):
         return re.sub(
-            r"\s+",
-            " ",
-            unescape(" ".join(self.textos)),
+            r"\s+", " ", unescape(" ".join(self.textos))
         ).strip()
 
 
@@ -254,41 +272,48 @@ def descargar_pagina(url):
             "Accept-Language": "es-ES,es;q=0.9",
         },
     )
-
-    with urllib.request.urlopen(peticion, timeout=TIMEOUT_WEB) as respuesta:
+    with urllib.request.urlopen(
+        peticion, timeout=TIMEOUT_WEB
+    ) as respuesta:
         contenido = respuesta.read()
         if respuesta.status != 200:
             raise RuntimeError(
                 "El portal respondió con HTTP " + str(respuesta.status)
             )
         charset = respuesta.headers.get_content_charset() or "utf-8"
-
     return contenido.decode(charset, errors="replace")
 
 
 def fecha_es(texto):
     if not texto:
         return None
-
     for formato in ("%d/%m/%Y", "%Y-%m-%d"):
         try:
             return datetime.strptime(texto.strip(), formato).date()
         except ValueError:
             pass
-
     return None
 
 
 # ============================================================
-# FILTROS
+# FILTROS DE OFERTAS
 # ============================================================
 
 def titulo_interesante(titulo):
-    titulo_normalizado = normalizar(titulo)
-    return any(
-        normalizar(puesto) in titulo_normalizado
-        for puesto in PUESTOS
-    )
+    t = normalizar(titulo)
+
+    # Exclusiones prioritarias para evitar falsos positivos.
+    prohibidos = [
+        "limpieza", "limpiador", "limpiadora",
+        "soldador", "soldadora", "fontanero",
+        "fontanera", "electricista", "fisioterapeuta",
+        "ingeniero", "ingeniera", "tecnico instalador",
+        "tecnica instaladora", "vigilante de seguridad",
+    ]
+    if any(p in t for p in prohibidos):
+        return False
+
+    return any(normalizar(puesto) in t for puesto in PUESTOS)
 
 
 def extraer_fechas(texto):
@@ -300,7 +325,6 @@ def extraer_fechas(texto):
         r"Fecha de fin\s*:?\s*(\d{2}/\d{2}/\d{4})",
         texto, re.IGNORECASE,
     )
-
     return (
         fecha_es(inicio.group(1)) if inicio else None,
         fecha_es(fin.group(1)) if fin else None,
@@ -317,12 +341,10 @@ def extraer_localidad(texto):
         r"(?=\s+(?:Datos adicionales|INSCRIPCION|INSCRIPCIÓN|"
         r"Requerimientos|Requisitos|Fecha de inicio|Fecha de fin)\b|$)",
     ]
-
     for patron in patrones:
         coincidencia = re.search(patron, texto, re.IGNORECASE)
         if coincidencia:
             return coincidencia.group(1).strip(" .,-")
-
     return ""
 
 
@@ -334,7 +356,6 @@ def extraer_salario_anual(texto):
         r"(\d{2,3}(?:[.\s]\d{3})+|\d{5,6})\s*€"
         r".{0,50}(?:anuales|al ano|anual|brutos al ano)",
     ]
-
     cantidades = []
     for patron in patrones:
         for cantidad in re.findall(patron, texto):
@@ -342,7 +363,6 @@ def extraer_salario_anual(texto):
                 cantidades.append(int(re.sub(r"[.\s]", "", cantidad)))
             except ValueError:
                 pass
-
     return min(cantidades) if cantidades else None
 
 
@@ -353,9 +373,11 @@ def comprobar_localidad(localidad, texto_completo):
         if clave in lugar:
             return nombre
 
+    # Murcia capital: se admite con salario publicado que alcance
+    # una referencia bruta orientativa; no garantiza 1.500 € netos.
     if re.match(r"^murcia(?:\s*\(murcia\))?$", lugar):
         salario = extraer_salario_anual(texto_completo)
-        if salario is not None and salario >= 24000:
+        if salario is not None and salario >= SALARIO_BRUTO_REFERENCIA:
             return "Murcia capital"
 
     return None
@@ -379,11 +401,9 @@ def motivo_descartada(titulo, texto, inicio, fin):
     titulo_normalizado = normalizar(titulo)
 
     if "vigilante de seguridad" in titulo_normalizado:
-        return "es un puesto de vigilante de seguridad"
-
+        return "puesto de vigilante de seguridad"
     if "tip en vigor" in texto_normalizado:
         return "exige TIP en vigor"
-
     if any(frase in texto_normalizado for frase in FRASES_NOCHE):
         return "indica expresamente turno nocturno"
 
@@ -413,13 +433,13 @@ def extraer_detalle(url, titulo_listado):
     if not titulo:
         titulo = "Oferta de empleo"
 
+    if not titulo_interesante(titulo):
+        logger.info("Oferta descartada | %s | puesto no compatible", titulo)
+        return None
+
     motivo = motivo_descartada(titulo, texto, inicio, fin)
     if motivo:
         logger.info("Oferta descartada | %s | %s", titulo, motivo)
-        return None
-
-    if not titulo_interesante(titulo):
-        logger.info("Oferta descartada | %s | título fuera de los puestos", titulo)
         return None
 
     localidad = extraer_localidad(texto)
@@ -447,7 +467,7 @@ def extraer_detalle(url, titulo_listado):
 
 
 # ============================================================
-# BUSQUEDA Y PAGINACION DEL PORTAL
+# BUSQUEDA Y PAGINACION
 # ============================================================
 
 def parece_pagina_de_resultados(href, url_actual):
@@ -456,15 +476,11 @@ def parece_pagina_de_resultados(href, url_actual):
 
     if "sistemanacionalempleo.es" not in parsed.netloc:
         return False
-
     if not parsed.path.endswith("busquedaOfertas.do"):
         return False
 
     parametros = parse_qs(parsed.query)
     modo = " ".join(parametros.get("modo", [])).lower()
-
-    # Solo seguimos enlaces del propio buscador que parezcan
-    # navegación de resultados, no fichas ni páginas de ayuda.
     if "continuar" in modo:
         return True
 
@@ -479,11 +495,9 @@ async def recoger_enlaces_listado():
     pendientes = [URL_LISTADO]
     paginas_visitadas = set()
     enlaces_ofertas = {}
-    pagina_base = urlparse(URL_LISTADO)
 
     while pendientes and len(paginas_visitadas) < MAX_PAGINAS:
         url_pagina = pendientes.pop(0)
-
         if url_pagina in paginas_visitadas:
             continue
 
@@ -493,7 +507,7 @@ async def recoger_enlaces_listado():
             html = await asyncio.to_thread(descargar_pagina, url_pagina)
         except Exception as error:
             logger.warning(
-                "No se pudo consultar una página del listado: %s (%s)",
+                "No se pudo consultar el listado: %s (%s)",
                 type(error).__name__, url_pagina,
             )
             continue
@@ -509,22 +523,17 @@ async def recoger_enlaces_listado():
                 continue
 
             if parece_pagina_de_resultados(href, url_pagina):
-                parsed = urlparse(url)
-                # No salir del buscador provincial de Murcia.
-                parametros = parse_qs(parsed.query)
+                parametros = parse_qs(urlparse(url).query)
                 provincia = parametros.get("provincia", ["30"])[0]
-
                 if provincia not in ("30", ""):
                     continue
-
                 if url not in paginas_visitadas and url not in pendientes:
                     pendientes.append(url)
 
         logger.info(
-            "Página de resultados revisada: %s; ofertas acumuladas: %s",
+            "Página revisada: %s; fichas acumuladas: %s",
             len(paginas_visitadas), len(enlaces_ofertas),
         )
-
         await asyncio.sleep(0.2)
 
     logger.info(
@@ -536,7 +545,6 @@ async def recoger_enlaces_listado():
 
 async def consultar_ofertas():
     logger.info("Consultando ofertas del Sistema Nacional de Empleo.")
-    logger.info("URL provincial: %s", URL_LISTADO)
 
     try:
         enlaces = await recoger_enlaces_listado()
@@ -545,22 +553,23 @@ async def consultar_ofertas():
         return []
 
     if not enlaces:
-        logger.warning(
-            "No se encontraron fichas. El portal puede haber cambiado "
-            "su sistema de búsqueda o paginación."
-        )
+        logger.warning("No se encontraron fichas en el listado.")
         return []
 
-    # Revisar primero los títulos que coinciden con tus puestos.
     enlaces.sort(
-        key=lambda elemento: 0 if titulo_interesante(elemento[1]) else 1
+        key=lambda elemento: (
+            0 if titulo_interesante(elemento[1]) else 1
+        )
     )
-    candidatos = enlaces[:MAX_CANDIDATOS]
 
+    candidatos = enlaces[:MAX_CANDIDATOS]
     resultados = []
+
     for url, titulo in candidatos:
         try:
-            oferta = await asyncio.to_thread(extraer_detalle, url, titulo)
+            oferta = await asyncio.to_thread(
+                extraer_detalle, url, titulo
+            )
             if oferta:
                 resultados.append(oferta)
         except Exception as error:
@@ -568,13 +577,9 @@ async def consultar_ofertas():
                 "No se pudo leer la ficha %s: %s",
                 titulo or "(sin título)", type(error).__name__,
             )
-
         await asyncio.sleep(0.2)
 
-    unicas = {}
-    for oferta in resultados:
-        unicas[oferta["id"]] = oferta
-
+    unicas = {oferta["id"]: oferta for oferta in resultados}
     resultados = list(unicas.values())
     resultados.sort(
         key=lambda oferta: oferta["inicio"] or date.min,
@@ -582,8 +587,7 @@ async def consultar_ofertas():
     )
 
     logger.info(
-        "Resumen: páginas de resultados consultadas; fichas revisadas=%s; "
-        "ofertas válidas=%s.",
+        "Resumen: fichas revisadas=%s; ofertas válidas=%s.",
         len(candidatos), len(resultados),
     )
     return resultados
@@ -599,11 +603,27 @@ def crear_mensaje(oferta):
         if oferta["inicio"] else "No indicada"
     )
     fin = oferta["fin"].strftime("%d/%m/%Y")
+
     salario = extraer_salario_anual(oferta["texto"])
-    salario_texto = (
-        f"{salario:,} € brutos/año".replace(",", ".")
-        if salario is not None else "No publicado"
-    )
+    if salario is not None:
+        salario_texto = (
+            f"{salario:,} € brutos/año".replace(",", ".")
+        )
+        if salario < SALARIO_BRUTO_REFERENCIA:
+            aviso_salario = (
+                "⚠️ El bruto publicado puede quedarse por debajo "
+                "del objetivo de 1.500 € netos/mes."
+            )
+        else:
+            aviso_salario = (
+                "ℹ️ Confirma el neto real y el número de pagas."
+            )
+    else:
+        salario_texto = "No publicado"
+        aviso_salario = (
+            "⚠️ No se puede comprobar si llega a 1.500 € netos/mes. "
+            "Consulta el salario antes de aceptar."
+        )
 
     requisitos = re.search(
         r"(?:REQUISITOS|REQUERIMIENTOS)\s*:?(.*?)(?:"
@@ -622,6 +642,7 @@ def crear_mensaje(oferta):
         "📅 Publicada desde: " + inicio,
         "⏳ Fecha límite: " + fin,
         "💶 Salario: " + salario_texto,
+        aviso_salario,
     ]
 
     if requisitos_texto:
@@ -654,13 +675,18 @@ async def comando_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     activar_chat(update.effective_chat.id)
     await update.message.reply_text(
         "✅ AVISOS DE EMPLEO ACTIVADOS\n\n"
-        "Te enviaré ofertas nuevas cuando las encuentre.\n\n"
+        "Te avisaré cuando encuentre ofertas nuevas.\n\n"
         "📍 San Javier, San Pedro del Pinatar, Los Alcázares, "
         "Torre-Pacheco y Cartagena.\n"
-        "🚚 Conducción, reparto, carretilla, almacén, logística, "
-        "producción, conserjería, mantenimiento y puestos similares.\n"
-        "🌙 Se descartan anuncios que indiquen expresamente turnos de noche.\n"
-        "💶 Murcia capital solo con salario anual publicado de al menos 24.000 €.\n\n"
+        "📍 Murcia capital: se requiere salario bruto publicado "
+        "de referencia de al menos 22.000 €/año.\n"
+        "🚚 Reparto, carnet B, furgoneta, carretilla, almacén, "
+        "logística y producción.\n"
+        "🏢 Conserjería y control de accesos.\n"
+        "🧹 Limpieza descartada.\n"
+        "🌙 Sin ofertas que indiquen expresamente turno nocturno.\n"
+        "💶 Objetivo: aproximadamente 1.500 € netos al mes; "
+        "si el salario no aparece, te lo indicaré.\n\n"
         "Usa /buscar para consultar ahora.\n"
         "Usa /parar para cancelar los avisos."
     )
@@ -674,8 +700,17 @@ async def comando_parar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def comando_buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global BUSQUEDA_EN_CURSO
+
+    if BUSQUEDA_EN_CURSO:
+        await update.message.reply_text(
+            "Ya hay una búsqueda en marcha. Espera a que termine."
+        )
+        return
+
+    BUSQUEDA_EN_CURSO = True
     mensaje = await update.message.reply_text(
-        "🔎 Consultando las páginas de ofertas de Murcia. Puede tardar un poco..."
+        "🔎 Buscando ofertas que encajen contigo. Puede tardar un poco..."
     )
 
     try:
@@ -683,20 +718,20 @@ async def comando_buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not ofertas:
             await mensaje.edit_text(
-                "No he encontrado ofertas que cumplan los filtros en esta consulta.\n\n"
-                "He registrado en Render cuántas páginas y fichas se han "
-                "consultado. Si el portal ha cambiado su paginación, "
-                "aparecerá en los registros."
+                "No he encontrado ofertas que cumplan los filtros "
+                "en esta consulta. Puedes intentarlo más tarde."
             )
             return
 
         await mensaje.edit_text(
-            f"✅ He encontrado {len(ofertas)} ofertas que pasan los filtros. "
+            f"✅ He encontrado {len(ofertas)} ofertas compatibles. "
             "Te envío las primeras."
         )
 
         for oferta in ofertas[:MAX_OFERTAS_ENVIO]:
-            await enviar_oferta(context.bot, update.effective_chat.id, oferta)
+            await enviar_oferta(
+                context.bot, update.effective_chat.id, oferta
+            )
             await asyncio.sleep(0.3)
 
     except Exception:
@@ -705,6 +740,8 @@ async def comando_buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Ha ocurrido un error al consultar las ofertas. "
             "Revisa los registros de Render."
         )
+    finally:
+        BUSQUEDA_EN_CURSO = False
 
 
 async def comando_portales(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -721,18 +758,22 @@ async def comando_preferencias(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     await update.message.reply_text(
-        "⚙️ FILTROS ACTUALES\n\n"
+        "⚙️ TUS FILTROS\n\n"
         "📍 San Javier\n"
         "📍 San Pedro del Pinatar\n"
         "📍 Los Alcázares\n"
         "📍 Torre-Pacheco\n"
         "📍 Cartagena\n"
-        "📍 Murcia capital: salario anual publicado de al menos 24.000 €\n\n"
-        "Puestos: conducción, reparto, carretilla, almacén, logística, "
-        "expediciones, producción, conserjería, control de accesos, "
-        "mantenimiento, limpieza y puestos similares.\n\n"
-        "Se descartan anuncios que mencionen expresamente turnos nocturnos "
-        "y los puestos de vigilante de seguridad."
+        "📍 Murcia capital: referencia bruta publicada de 22.000 €/año.\n\n"
+        "💶 Objetivo aproximado: 1.500 € netos al mes.\n"
+        "🚚 Reparto, conducción B, furgoneta, carretilla, "
+        "almacén, logística y producción.\n"
+        "🏢 Conserjería y control de accesos.\n"
+        "🧹 Limpieza descartada.\n"
+        "🌙 Turnos nocturnos anunciados descartados.\n"
+        "🔧 Sin especialidades técnicas excluidas.\n\n"
+        "Si una oferta no publica salario, se indicará para "
+        "que puedas comprobarlo antes de inscribirte."
     )
 
 
@@ -740,11 +781,11 @@ async def comando_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 COMANDOS\n\n"
         "/start - Activar avisos\n"
-        "/buscar - Consultar ofertas ahora\n"
-        "/scan - Consultar ofertas ahora\n"
-        "/ofertas - Consultar ofertas ahora\n"
+        "/buscar - Buscar ofertas ahora\n"
+        "/scan - Buscar ofertas ahora\n"
+        "/ofertas - Buscar ofertas ahora\n"
         "/portales - Ver la fuente\n"
-        "/preferencias - Ver filtros\n"
+        "/preferencias - Ver tus filtros\n"
         "/parar - Desactivar avisos\n"
         "/ayuda - Mostrar ayuda"
     )
@@ -758,7 +799,7 @@ async def revisar_nuevas(application):
     chats = suscriptores()
 
     if not chats:
-        logger.info("No hay suscriptores activos. El usuario debe enviar /start.")
+        logger.info("No hay suscriptores activos. Usa /start.")
         return
 
     ofertas = await consultar_ofertas()
@@ -825,6 +866,7 @@ async def tarea_automatica(application):
 async def al_iniciar(application):
     global TAREA_AUTOMATICA
 
+    # Evita mantener un webhook configurado mientras se usa polling.
     await application.bot.delete_webhook(drop_pending_updates=False)
 
     if TAREA_AUTOMATICA is None or TAREA_AUTOMATICA.done():
@@ -897,7 +939,7 @@ def main():
 
     logger.info("Bot iniciado. Fuente: Sistema Nacional de Empleo.")
     logger.info("No se utilizan créditos de JOA.")
-    logger.info("Máximo de páginas de resultados por búsqueda: %s", MAX_PAGINAS)
+    logger.info("Búsqueda automática cada %s segundos.", INTERVALO_BUSQUEDA)
 
     aplicacion.run_polling(drop_pending_updates=False)
 
