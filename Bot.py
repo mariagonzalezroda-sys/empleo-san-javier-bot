@@ -689,6 +689,56 @@ async def consultar_ofertas():
     return ofertas
 
 
+
+async def comando_diagnostico(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comprueba qué devuelve cada página sin aplicar todavía los filtros finales."""
+    await update.message.reply_text(
+        "🧪 Comprobando las páginas de empleo. Puede tardar hasta un minuto..."
+    )
+    lineas = ["🧪 DIAGNÓSTICO DE FUENTES"]
+    fuentes = [("Sistema Nacional de Empleo", URL_LISTADO)] + [
+        (urlparse(url).netloc.replace("www.", ""), url)
+        for url in URLS_EXTERNAS
+    ]
+
+    for nombre, url in fuentes:
+        try:
+            html = await asyncio.to_thread(descargar_pagina, url)
+            lector = LectorHTML()
+            lector.feed(html)
+            enlaces = [
+                (href, titulo.strip())
+                for href, titulo in lector.enlaces
+                if href and titulo.strip()
+            ]
+            candidatos = [
+                (href, titulo) for href, titulo in enlaces
+                if titulo_interesante(titulo)
+            ]
+            texto = lector.texto_completo().lower()
+            bloqueos = any(p in texto for p in (
+                "captcha", "verify you are human", "enable javascript",
+                "robot check", "access denied", "unusual traffic"
+            ))
+            estado = "posible bloqueo/JavaScript" if bloqueos else "página leída"
+            lineas.append(
+                f"\n• {nombre}: {len(enlaces)} enlaces con texto; "
+                f"{len(candidatos)} títulos compatibles; {estado}"
+            )
+        except Exception as exc:
+            lineas.append(
+                f"\n• {nombre}: ERROR {type(exc).__name__}: "
+                f"{str(exc)[:100]}"
+            )
+
+    lineas.append(
+        "\nSi una fuente muestra 0 enlaces o 0 títulos compatibles, "
+        "el bot no está obteniendo ofertas de esa página."
+    )
+    respuesta = "\n".join(lineas)
+    for inicio in range(0, len(respuesta), 3800):
+        await update.message.reply_text(respuesta[inicio:inicio + 3800])
+
 # ============================================================
 # MENSAJES
 # ============================================================
@@ -905,7 +955,7 @@ async def comando_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/buscar - Buscar ofertas nuevas\n"
         "/scan - Buscar ofertas nuevas\n"
         "/ofertas - Buscar ofertas nuevas\n"
-        "/portales - Ver fuente\n"
+        "/portales - Ver fuente\n"        "/diagnostico - Comprobar qué lee cada portal\n"
         "/preferencias - Ver filtros\n"
         "/parar - Desactivar avisos\n"
         "/ayuda - Mostrar ayuda"
@@ -1047,6 +1097,7 @@ def main():
     aplicacion.add_handler(CommandHandler("scan", comando_buscar))
     aplicacion.add_handler(CommandHandler("ofertas", comando_buscar))
     aplicacion.add_handler(CommandHandler("portales", comando_portales))
+    aplicacion.add_handler(CommandHandler("diagnostico", comando_diagnostico))
     aplicacion.add_handler(
         CommandHandler("preferencias", comando_preferencias)
     )
