@@ -42,8 +42,9 @@ URL_LISTADO = (
 URLS_EXTERNAS = [
     "https://activa.sanjavier.es/empleo",
     "https://www.interempleo.es/es/ofertas-de-empleo/carretillerosas-zona-san-javier",
-    "https://es.indeed.com/jobs?q=conductor+repartidor+carretillero+mozo+almacen&l=San+Javier%2C+Murcia",
-    "https://es.indeed.com/jobs?q=operario+produccion+preparacion+pedidos&l=Torre-Pacheco%2C+Murcia",
+    "https://es.indeed.com/Ofertas-en-San-Javier-%2C-Murcia",
+    "https://es.indeed.com/q-carretillero-l-torre-pacheco%2C-murcia-provincia-empleos.html",
+    "https://es.indeed.com/q-almac%C3%A9n-y-empaquetado-l-cartagena%2C-murcia-provincia-empleos.html",
     "https://jobtoday.com/es/trabajos-transporte-y-reparto/san-javier",
 ]
 
@@ -627,6 +628,9 @@ def extraer_detalle_externo(url, titulo_listado):
     if any(normalizar(frase) in combinado for frase in FRASES_NOCHE):
         return None
     if "tip en vigor" in combinado:
+        return None
+    # El usuario tiene permiso B: no enviar puestos que exigen permisos profesionales superiores.
+    if re.search(r"carnet(?: de conducir)?\\s*(?:c\\+e|c1|c|d|adr)|permiso de conducir\\s*(?:c\\+e|c1|c|d)|carnet c\\s*\\+\\s*cap|cap en vigor", combinado):
         return None
     if re.search(r"desemplead[oa]s? de larga duracion|parad[oa]s? de larga duracion|"
                  r"estar desemplead[oa]s?|inscrit[oa]s? como demandante de empleo.{0,100}"
