@@ -30,6 +30,7 @@ MAX_PRIMER_ENVIO = 5
 MAX_CANDIDATOS = 120
 MAX_PAGINAS = 12
 TIMEOUT_WEB = 25
+MAX_ANTIGUEDAD_OFERTA_DIAS = 30
 SALARIO_BRUTO_REFERENCIA = 24000
 
 URL_LISTADO = (
@@ -501,6 +502,38 @@ def extraer_localidad(texto):
     return ""
 
 
+def extraer_fecha_publicacion(texto, titulo=""):
+    """
+    Detecta la fecha de publicación de portales externos.
+    Si el portal no facilita fecha, devuelve None y no se inventa una.
+    """
+    combinado = str(titulo or "") + " " + str(texto or "")
+    patrones_prioritarios = [
+        r"datePosted[^0-9]{0,20}(\d{4})-(\d{2})-(\d{2})",
+        r"(?:publicad[oa]|publicacion|publicación|actualizaci[oó]n de la oferta)"
+        r"[^0-9]{0,35}(\d{1,2})[/-](\d{1,2})[/-](\d{4})",
+    ]
+    for patron in patrones_prioritarios:
+        m = re.search(patron, combinado, re.IGNORECASE)
+        if not m:
+            continue
+        try:
+            if "datePosted" in patron:
+                return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            continue
+
+    # Algunas páginas muestran la fecha en formato ISO sin etiqueta legible.
+    m = re.search(r"\b(20\d{2})-(\d{2})-(\d{2})(?:T\d{2}:\d{2})?", combinado)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    return None
+
+
 def extraer_salario_hora(texto):
     # Acepta formatos habituales: 9,55-10,55 €/hora o 11,48 euros/hora.
     texto = normalizar(texto).replace(" ", "")
@@ -757,9 +790,18 @@ def extraer_detalle_externo(url, titulo_listado):
     lector = LectorHTML()
     lector.feed(html)
     texto = lector.texto_completo()
-    combinado = normalizar(titulo_listado + " " + texto)
+    titulo_limpio = re.sub(r"^\s*operational\s+", "", titulo_listado, flags=re.IGNORECASE).strip()
+    combinado = normalizar(titulo_limpio + " " + texto)
 
-    if not titulo_interesante(titulo_listado):
+    if not titulo_interesante(titulo_limpio):
+        return None
+
+    fecha_publicacion = extraer_fecha_publicacion(texto, titulo_limpio)
+    if fecha_publicacion and (date.today() - fecha_publicacion).days > MAX_ANTIGUEDAD_OFERTA_DIAS:
+        logger.info(
+            "Descartada oferta externa antigua | %s | publicada %s",
+            titulo_limpio, fecha_publicacion.isoformat()
+        )
         return None
 
     # No aceptar montajes que en realidad exigen soldadura especializada.
@@ -776,7 +818,7 @@ def extraer_detalle_externo(url, titulo_listado):
         ("torre pacheco", "Torre-Pacheco"),
         ("cartagena", "Cartagena"),
     ]
-    texto_ubicacion = normalizar(titulo_listado + " " + texto[:700])
+    texto_ubicacion = normalizar(titulo_limpio + " " + texto[:700])
     zona = next((nombre for clave, nombre in zonas if clave in texto_ubicacion), None)
 
     # Espinardo y Murcia capital quedan fuera salvo que se confirme un salario
@@ -813,7 +855,7 @@ def extraer_detalle_externo(url, titulo_listado):
     identificador = hashlib.sha256(url.encode("utf-8")).hexdigest()
     return {
         "id": identificador,
-        "titulo": titulo_listado,
+        "titulo": titulo_limpio,
         "zona": zona,
         "url": url,
         "inicio": inicio,
@@ -862,6 +904,27 @@ def extraer_ofertas_activa():
             bloque,
             re.IGNORECASE,
         )
+        if fecha_match:
+            fecha_actualizacion = None
+            fecha_txt = fecha_match.group(1)
+            try:
+                if "/" in fecha_txt:
+                    fecha_actualizacion = fecha_es(fecha_txt)
+                else:
+                    meses = {
+                        "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+                        "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+                        "septiembre": 9, "octubre": 10, "noviembre": 11,
+                        "diciembre": 12,
+                    }
+                    mm = re.fullmatch(r"(\d{1,2}) de ([a-záéíóú]+) de (\d{4})", fecha_txt.lower())
+                    if mm and mm.group(2) in meses:
+                        fecha_actualizacion = date(int(mm.group(3)), meses[mm.group(2)], int(mm.group(1)))
+            except (ValueError, TypeError):
+                fecha_actualizacion = None
+            if fecha_actualizacion and (date.today() - fecha_actualizacion).days > MAX_ANTIGUEDAD_OFERTA_DIAS:
+                continue
+
         if not titulo_interesante(titulo):
             continue
 
