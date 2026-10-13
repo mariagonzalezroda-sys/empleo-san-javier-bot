@@ -42,9 +42,14 @@ URL_LISTADO = (
 URLS_EXTERNAS = [
     "https://activa.sanjavier.es/empleo",
     "https://www.interempleo.es/es/ofertas-de-empleo/carretillerosas-zona-san-javier",
-    # Indeed devuelve HTTP 403 desde el servidor; se conserva fuera de la consulta
-    # automática para evitar perder tiempo en cada búsqueda.
     "https://jobtoday.com/es/trabajos-transporte-y-reparto/san-javier",
+    # Randstad publica fichas individuales y permite encontrar puestos de almacén,
+    # carretilla, reparto y producción en las zonas cercanas.
+    "https://www.randstad.es/candidatos/ofertas-empleo/p-murcia/c-cartagena/pg-1/",
+    "https://www.randstad.es/candidatos/ofertas-empleo/p-murcia/",
+    # InfoJobs como fuente adicional; si bloquea el acceso, las otras fuentes siguen.
+    "https://www.infojobs.net/ofertas-trabajo/murcia/san-javier/trabajo",
+    "https://www.infojobs.net/ofertas-trabajo/murcia/cartagena",
 ]
 
 ZONAS = {
@@ -1190,7 +1195,7 @@ async def comando_ultimas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def comando_portales(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Fuentes gratuitas: Sistema Nacional de Empleo, Indeed, Job Today, Activa San Javier e Interempleo.\n\n"
+        "Fuentes gratuitas: Sistema Nacional de Empleo, Activa San Javier, JobToday, Randstad, InfoJobs e Interempleo.\n\n"
         "Cada oferta incluye un enlace a su página original para comprobar si sigue activa.\n\n"
         "Esta consulta no utiliza créditos de JOA."
     )
