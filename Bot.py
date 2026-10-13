@@ -1,25 +1,24 @@
 
 import os
 import re
-import json
-import time
-import sqlite3
 import asyncio
+import sqlite3
+import hashlib
 import logging
 import threading
-import unicodedata
-from datetime import datetime, timezone, timedelta
-from urllib.parse import urlencode, quote_plus
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
-from zoneinfo import ZoneInfo
+import urllib.request
+import xml.etree.ElementTree as ET
 
-from flask import Flask, jsonify
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from html import unescape
+from html.parser import HTMLParser
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
+
+from flask import Flask
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     ContextTypes,
 )
 
@@ -28,50 +27,119 @@ from telegram.ext import (
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-JOA_API_KEY = os.getenv("JOA_API_KEY")
 PORT = int(os.getenv("PORT", "10000"))
+DATABASE_PATH = os.getenv("DATABASE_PATH", "bot_empleo.sqlite3")
 
-API_URL = "https://api.jobopportunitiesapi.org/v1/jobs"
-
-# Limite para proteger la cuota gratuita.
-# Cada registro devuelto consume cuota, tambien en /buscar.
-LIMITE_API = 25
-INTERVALO_ALERTAS = 24 * 60 * 60
-ESPERA_PRIMERA_ALERTA = 30
-MAX_OFERTAS_TELEGRAM = 8
-
-# Archivo local para guardar chats y ofertas enviadas.
-# Render gratuito puede perderlo al reemplazar el sistema
-# de archivos durante determinados despliegues.
-RUTA_BD = os.getenv("BOT_DB_PATH", "bot_empleo.sqlite3")
+INTERVALO_BUSQUEDA = 2 * 60 * 60
+MAX_OFERTAS_POR_ENVIO = 8
+MAX_OFERTAS_PRIMER_ENVIO = 5
+EDAD_MAXIMA_DIAS = 30
 
 ZONAS_PRIORITARIAS = [
     "san javier",
     "san pedro del pinatar",
     "los alcazares",
+    "los alcázares",
     "torre pacheco",
+    "torre-pacheco",
     "cartagena",
 ]
 
-SALARIO_MINIMO_MURCIA = 24000
+# RSS oficiales del Portal Unico de Empleo.
+# No necesitan clave de API ni creditos de JOA.
+
+CANALES_RSS = {
+    "Conductores y transporte":
+        "https://bnde.sistemanacionalempleo.es/es/portaltrabaja/resources/rss/Conductores_Transporte.xml",
+
+    "Almacenes y reponedores":
+        "https://bnde.sistemanacionalempleo.es/es/portaltrabaja/resources/rss/Almacenes_Reponedores.xml",
+
+    "Limpieza y cuidado":
+        "https://bnde.sistemanacionalempleo.es/es/portaltrabaja/resources/rss/Limpieza_CuidadoDePersonas.xml",
+
+    "Vigilancia y servicios":
+        "https://bnde.sistemanacionalempleo.es/es/portaltrabaja/resources/rss/Vigilancia_Servicios.xml",
+
+    "Administracion":
+        "https://bnde.sistemanacionalempleo.es/es/portaltrabaja/resources/rss/Administracion.xml",
+
+    "Comercial y ventas":
+        "https://bnde.sistemanacionalempleo.es/es/portaltrabaja/resources/rss/Comercial_Ventas.xml",
+
+    "Industria":
+        "https://bnde.sistemanacionalempleo.es/es/portaltrabaja/resources/rss/Fabricas_Industria.xml",
+
+    "Metal y mecanica":
+        "https://bnde.sistemanacionalempleo.es/es/portaltrabaja/resources/rss/Metal_Mecanica.xml",
+}
+
+PALABRAS_TRABAJO = [
+    "conductor",
+    "conductora",
+    "repartidor",
+    "repartidora",
+    "transportista",
+    "carretillero",
+    "carretillera",
+    "mozo de almacen",
+    "mozo/a de almacen",
+    "almacenista",
+    "logistica",
+    "expediciones",
+    "reponedor",
+    "reponedora",
+    "conserje",
+    "control de accesos",
+    "controlador de accesos",
+    "auxiliar de servicios",
+    "recepcionista",
+    "mantenimiento",
+    "operario",
+    "operaria",
+    "produccion",
+    "limpieza",
+    "limpiador",
+    "limpiadora",
+    "preparador de pedidos",
+    "preparadora de pedidos",
+    "administrativo de logistica",
+    "administrativa de logistica",
+    "dependiente",
+    "dependienta",
+    "supermercado",
+    "maquinista",
+    "reparto",
+]
+
+PALABRAS_NOCHE = [
+    "turno de noche",
+    "turno nocturno",
+    "turno fijo de noche",
+    "trabajo nocturno",
+    "jornada nocturna",
+    "solo noches",
+    "solo turno noche",
+    "de lunes a domingo en turno de noche",
+]
+
+# ============================================================
+# REGISTRO Y BASE DE DATOS
+# ============================================================
 
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)
+
+logger = logging.getLogger("bot_empleo")
 
 app_web = Flask(__name__)
-suscriptores = set()
 
-
-# ============================================================
-# BASE DE DATOS LOCAL
-# ============================================================
 
 def conectar_bd():
-    conexion = sqlite3.connect(RUTA_BD, timeout=15)
-    conexion.execute("PRAGMA busy_timeout = 15000")
+    conexion = sqlite3.connect(DATABASE_PATH, timeout=20)
+    conexion.execute("PRAGMA busy_timeout=20000")
     return conexion
 
 
@@ -79,99 +147,697 @@ def inicializar_bd():
     with conectar_bd() as conexion:
         conexion.execute("""
             CREATE TABLE IF NOT EXISTS suscriptores (
-                chat_id TEXT PRIMARY KEY,
-                creado_en TEXT NOT NULL
+                chat_id INTEGER PRIMARY KEY
             )
         """)
 
         conexion.execute("""
-            CREATE TABLE IF NOT EXISTS ofertas_enviadas (
-                chat_id TEXT NOT NULL,
-                oferta_id TEXT NOT NULL,
-                enviada_en TEXT NOT NULL,
-                PRIMARY KEY (chat_id, oferta_id)
+            CREATE TABLE IF NOT EXISTS ofertas_vistas (
+                oferta_id TEXT PRIMARY KEY,
+                fecha_envio TEXT
             )
         """)
 
+        conexion.execute("""
+            CREATE TABLE IF NOT EXISTS configuracion (
+                clave TEXT PRIMARY KEY,
+                valor TEXT
+            )
+        """)
+
+
+def obtener_suscriptores():
+    with conectar_bd() as conexion:
         filas = conexion.execute(
             "SELECT chat_id FROM suscriptores"
         ).fetchall()
 
-    suscriptores.clear()
-
-    for fila in filas:
-        try:
-            suscriptores.add(int(fila[0]))
-        except (ValueError, TypeError):
-            continue
-
-    logging.info(
-        "Base de datos local preparada. Chats guardados: %s",
-        len(suscriptores),
-    )
+    return [fila[0] for fila in filas]
 
 
 def guardar_suscriptor(chat_id):
-    suscriptores.add(chat_id)
-
     with conectar_bd() as conexion:
         conexion.execute(
-            """
-            INSERT OR IGNORE INTO suscriptores (chat_id, creado_en)
-            VALUES (?, ?)
-            """,
-            (
-                str(chat_id),
-                datetime.now(timezone.utc).isoformat(),
-            ),
+            "INSERT OR IGNORE INTO suscriptores (chat_id) VALUES (?)",
+            (chat_id,),
         )
 
 
-def oferta_ya_enviada(chat_id, oferta_id):
+def borrar_suscriptor(chat_id):
+    with conectar_bd() as conexion:
+        conexion.execute(
+            "DELETE FROM suscriptores WHERE chat_id = ?",
+            (chat_id,),
+        )
+
+
+def ofertas_registradas():
+    with conectar_bd() as conexion:
+        filas = conexion.execute(
+            "SELECT oferta_id FROM ofertas_vistas"
+        ).fetchall()
+
+    return {fila[0] for fila in filas}
+
+
+def registrar_ofertas(identificadores):
+    if not identificadores:
+        return
+
+    fecha = datetime.now(timezone.utc).isoformat()
+
+    with conectar_bd() as conexion:
+        conexion.executemany(
+            """
+            INSERT OR IGNORE INTO ofertas_vistas
+            (oferta_id, fecha_envio)
+            VALUES (?, ?)
+            """,
+            [(identificador, fecha) for identificador in identificadores],
+        )
+
+
+def primer_arranque():
     with conectar_bd() as conexion:
         fila = conexion.execute(
-            """
-            SELECT 1 FROM ofertas_enviadas
-            WHERE chat_id = ? AND oferta_id = ?
-            """,
-            (str(chat_id), str(oferta_id)),
+            "SELECT valor FROM configuracion WHERE clave = 'inicializado'"
         ).fetchone()
 
-    return fila is not None
+    return fila is None
 
 
-def marcar_oferta_enviada(chat_id, oferta_id):
+def marcar_arranque():
     with conectar_bd() as conexion:
         conexion.execute(
             """
-            INSERT OR IGNORE INTO ofertas_enviadas
-            (chat_id, oferta_id, enviada_en)
-            VALUES (?, ?, ?)
-            """,
-            (
-                str(chat_id),
-                str(oferta_id),
-                datetime.now(timezone.utc).isoformat(),
-            ),
+            INSERT OR REPLACE INTO configuracion (clave, valor)
+            VALUES ('inicializado', 'si')
+            """
         )
 
 
 # ============================================================
-# SERVIDOR WEB PARA RENDER
+# LECTURA DE RSS
+# ============================================================
+
+class LimpiadorHTML(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.partes = []
+
+    def handle_data(self, data):
+        self.partes.append(data)
+
+    def texto(self):
+        return " ".join(self.partes)
+
+
+def limpiar_html(texto):
+    if not texto:
+        return ""
+
+    texto = unescape(str(texto))
+    limpiador = LimpiadorHTML()
+
+    try:
+        limpiador.feed(texto)
+        resultado = limpiador.texto()
+    except Exception:
+        resultado = texto
+
+    return re.sub(r"\s+", " ", resultado).strip()
+
+
+def valor_elemento(elemento, nombres):
+    for hijo in elemento.iter():
+        nombre = hijo.tag.split("}")[-1].lower()
+
+        if nombre in nombres and hijo.text:
+            return hijo.text.strip()
+
+    return ""
+
+
+def interpretar_fecha(texto):
+    if not texto:
+        return None
+
+    try:
+        fecha = parsedate_to_datetime(texto)
+
+        if fecha.tzinfo is None:
+            fecha = fecha.replace(tzinfo=timezone.utc)
+
+        return fecha.astimezone(timezone.utc)
+
+    except Exception:
+        pass
+
+    try:
+        fecha = datetime.fromisoformat(
+            texto.replace("Z", "+00:00")
+        )
+
+        if fecha.tzinfo is None:
+            fecha = fecha.replace(tzinfo=timezone.utc)
+
+        return fecha.astimezone(timezone.utc)
+
+    except Exception:
+        return None
+
+
+def leer_un_rss(nombre_canal, url):
+    peticion = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "BotEmpleoSanJavier/1.0",
+            "Accept": "application/rss+xml, application/xml, text/xml",
+        },
+    )
+
+    with urllib.request.urlopen(peticion, timeout=20) as respuesta:
+        contenido = respuesta.read()
+
+    raiz = ET.fromstring(contenido)
+    resultados = []
+
+    elementos = [
+        elemento for elemento in raiz.iter()
+        if elemento.tag.split("}")[-1].lower() in ("item", "entry")
+    ]
+
+    ahora = datetime.now(timezone.utc)
+    limite = ahora - timedelta(days=EDAD_MAXIMA_DIAS)
+
+    for elemento in elementos:
+        titulo = valor_elemento(elemento, {"title"})
+        enlace = valor_elemento(elemento, {"link", "guid"})
+        descripcion = valor_elemento(
+            elemento,
+            {"description", "summary", "encoded", "content"},
+        )
+
+        fecha_texto = valor_elemento(
+            elemento,
+            {"pubdate", "published", "updated", "date"},
+        )
+
+        # Algunos RSS utilizan link como atributo href.
+        if not enlace:
+            for hijo in elemento.iter():
+                if hijo.tag.split("}")[-1].lower() == "link":
+                    enlace = hijo.attrib.get("href", "")
+                    if enlace:
+                        break
+
+        titulo = limpiar_html(titulo)
+        descripcion = limpiar_html(descripcion)
+        enlace = unescape(enlace.strip()) if enlace else ""
+
+        if not titulo or not enlace.startswith("http"):
+            continue
+
+        fecha = interpretar_fecha(fecha_texto)
+
+        # No enviar anuncios antiguos si el RSS proporciona fecha.
+        if fecha and fecha < limite:
+            continue
+
+        identificador = hashlib.sha256(
+            (enlace or (titulo + descripcion)).encode("utf-8")
+        ).hexdigest()
+
+        resultados.append({
+            "id": identificador,
+            "titulo": titulo,
+            "enlace": enlace,
+            "descripcion": descripcion,
+            "fecha": fecha,
+            "canal": nombre_canal,
+        })
+
+    logger.info(
+        "RSS %s: %s entradas recibidas",
+        nombre_canal,
+        len(resultados),
+    )
+
+    return resultados
+
+
+async def consultar_rss():
+    tareas = [
+        asyncio.to_thread(leer_un_rss, nombre, url)
+        for nombre, url in CANALES_RSS.items()
+    ]
+
+    respuestas = await asyncio.gather(
+        *tareas,
+        return_exceptions=True,
+    )
+
+    ofertas = []
+    canales_correctos = 0
+
+    for respuesta in respuestas:
+        if isinstance(respuesta, Exception):
+            logger.warning("Error leyendo RSS: %s", respuesta)
+            continue
+
+        canales_correctos += 1
+        ofertas.extend(respuesta)
+
+    # Quitar duplicados entre categorias.
+    unicas = {}
+
+    for oferta in ofertas:
+        unicas[oferta["id"]] = oferta
+
+    logger.info(
+        "Consulta RSS terminada: %s canales correctos, %s ofertas unicas",
+        canales_correctos,
+        len(unicas),
+    )
+
+    return list(unicas.values())
+
+
+# ============================================================
+# FILTRO DE OFERTAS
+# ============================================================
+
+def normalizar(texto):
+    texto = (texto or "").lower()
+
+    reemplazos = {
+        "á": "a",
+        "é": "e",
+        "í": "i",
+        "ó": "o",
+        "ú": "u",
+        "ü": "u",
+    }
+
+    for original, nuevo in reemplazos.items():
+        texto = texto.replace(original, nuevo)
+
+    return texto
+
+
+def salario_anual_minimo(texto):
+    """
+    Intenta detectar salarios anuales de 24.000 euros o superiores.
+    Si no puede determinarlo, devuelve None.
+    """
+    texto = normalizar(texto)
+
+    patrones = [
+        r"(\d{2,3}(?:[.\s]\d{3})+|\d{5,6})\s*euros?\s*(?:brutos?\s*)?(?:anuales|al ano|\/ano|anual)",
+        r"(\d{2,3}(?:[.\s]\d{3})+|\d{5,6})\s*€\s*(?:brutos?\s*)?(?:anuales|al ano|\/ano|anual)",
+    ]
+
+    cantidades = []
+
+    for patron in patrones:
+        for coincidencia in re.findall(patron, texto):
+            numero = re.sub(r"[.\s]", "", coincidencia)
+
+            try:
+                cantidades.append(int(numero))
+            except ValueError:
+                pass
+
+    if not cantidades:
+        return None
+
+    return min(cantidades)
+
+
+def ubicacion_valida(texto):
+    texto = normalizar(texto)
+
+    for zona in ZONAS_PRIORITARIAS:
+        if normalizar(zona) in texto:
+            return zona.title()
+
+    # Murcia capital solo si se publica un salario anual minimo
+    # de al menos 24.000 euros.
+    menciona_murcia = "murcia" in texto
+    menciona_region = "region de murcia" in texto
+
+    if menciona_murcia and not any(
+        normalizar(zona) in texto for zona in ZONAS_PRIORITARIAS
+    ):
+        salario = salario_anual_minimo(texto)
+
+        if salario is not None and salario >= 24000:
+            return "Murcia capital"
+
+        return None
+
+    # No aceptar anuncios que solo indiquen la region completa.
+    if menciona_region:
+        return None
+
+    return None
+
+
+def oferta_valida(oferta):
+    titulo = normalizar(oferta["titulo"])
+    descripcion = normalizar(oferta["descripcion"])
+    texto = titulo + " " + descripcion
+
+    # Evitar puestos de vigilante de seguridad que suelen requerir TIP.
+    # Se mantienen conserjeria, control de accesos y auxiliar de servicios.
+    if "vigilante de seguridad" in titulo:
+        return False
+
+    if "tip en vigor" in texto and "control de accesos" not in titulo:
+        return False
+
+    # Evitar turnos de noche expresamente anunciados.
+    if any(palabra in texto for palabra in PALABRAS_NOCHE):
+        return False
+
+    # Exigir que el titulo encaje con los trabajos buscados.
+    if not any(
+        normalizar(palabra) in titulo
+        for palabra in PALABRAS_TRABAJO
+    ):
+        return False
+
+    ubicacion = ubicacion_valida(texto)
+
+    if not ubicacion:
+        return False
+
+    oferta["ubicacion_detectada"] = ubicacion
+    return True
+
+
+def ordenar_ofertas(ofertas):
+    fecha_antigua = datetime.min.replace(tzinfo=timezone.utc)
+
+    return sorted(
+        ofertas,
+        key=lambda oferta: oferta["fecha"] or fecha_antigua,
+        reverse=True,
+    )
+
+
+def formatear_fecha(fecha):
+    if not fecha:
+        return "No indicada"
+
+    return fecha.astimezone().strftime("%d/%m/%Y %H:%M")
+
+
+def crear_mensaje(oferta):
+    descripcion = oferta["descripcion"]
+
+    if len(descripcion) > 500:
+        descripcion = descripcion[:497].rsplit(" ", 1)[0] + "..."
+
+    partes = [
+        "🆕 OFERTA DE EMPLEO",
+        "",
+        "💼 " + oferta["titulo"],
+        "📍 Zona: " + oferta["ubicacion_detectada"],
+        "📂 Fuente: SEPE / Portal Único de Empleo",
+        "📅 Publicada: " + formatear_fecha(oferta["fecha"]),
+    ]
+
+    if descripcion:
+        partes.extend(["", "📝 " + descripcion])
+
+    partes.extend([
+        "",
+        "🔗 Inscripción o información:",
+        oferta["enlace"],
+        "",
+        "⚠️ Comprueba que la oferta siga activa y revisa el horario y las condiciones.",
+    ])
+
+    return "\n".join(partes)[:3900]
+
+
+# ============================================================
+# BUSQUEDA Y ENVIO
+# ============================================================
+
+async def buscar_ofertas_validas():
+    ofertas = await consultar_rss()
+
+    validas = [
+        oferta for oferta in ofertas
+        if oferta_valida(oferta)
+    ]
+
+    return ordenar_ofertas(validas)
+
+
+async def enviar_oferta(bot, chat_id, oferta):
+    await bot.send_message(
+        chat_id=chat_id,
+        text=crear_mensaje(oferta),
+        disable_web_page_preview=True,
+    )
+
+
+async def comando_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    chat_id = update.effective_chat.id
+    guardar_suscriptor(chat_id)
+
+    await update.message.reply_text(
+        "✅ BOT DE EMPLEO ACTIVADO\n\n"
+        "Te enviaré automáticamente ofertas nuevas que encajen "
+        "con tus preferencias y tu zona.\n\n"
+        "📍 San Javier, San Pedro del Pinatar, Los Alcázares, "
+        "Torre-Pacheco y Cartagena.\n"
+        "🚚 Conductores, repartidores, carretilleros, almacén, "
+        "logística, conserjería, accesos y otros puestos similares.\n\n"
+        "🌙 Intentaré excluir las ofertas que indiquen turno de noche.\n"
+        "💶 Murcia capital solo si se identifica un salario anual "
+        "de al menos 24.000 €.\n\n"
+        "Usa /buscar para comprobar las ofertas disponibles ahora.\n"
+        "Usa /parar si no quieres recibir más avisos."
+    )
+
+
+async def comando_parar(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    borrar_suscriptor(update.effective_chat.id)
+
+    await update.message.reply_text(
+        "Has desactivado los avisos automáticos. "
+        "Puedes volver a activarlos con /start."
+    )
+
+
+async def comando_buscar(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    mensaje = await update.message.reply_text(
+        "🔎 Consultando los canales RSS gratuitos del SEPE..."
+    )
+
+    try:
+        ofertas = await buscar_ofertas_validas()
+
+        if not ofertas:
+            await mensaje.edit_text(
+                "No he encontrado ofertas que cumplan todos los filtros "
+                "en los canales consultados.\n\n"
+                "Esto no significa que no existan ofertas en la zona. "
+                "Probaremos más fuentes gratuitas si hace falta."
+            )
+            return
+
+        await mensaje.edit_text(
+            "✅ He encontrado " + str(len(ofertas)) +
+            " ofertas que coinciden con los filtros."
+        )
+
+        for oferta in ofertas[:MAX_OFERTAS_POR_ENVIO]:
+            await enviar_oferta(
+                context.bot,
+                update.effective_chat.id,
+                oferta,
+            )
+
+    except Exception:
+        logger.exception("Error en la busqueda manual")
+
+        await mensaje.edit_text(
+            "No he podido completar la consulta. "
+            "Revisa los registros de Render para ver qué canal ha fallado."
+        )
+
+
+async def comando_portales(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text(
+        "📚 FUENTES GRATUITAS ACTIVAS\n\n"
+        "Los canales RSS oficiales del Portal Único de Empleo del SEPE "
+        "que consulta este bot son:\n\n"
+        + "\n".join("• " + nombre for nombre in CANALES_RSS)
+        + "\n\nNo se utiliza JOA ni se consumen sus créditos."
+    )
+
+
+async def comando_preferencias(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text(
+        "⚙️ TUS FILTROS ACTUALES\n\n"
+        "📍 San Javier\n"
+        "📍 San Pedro del Pinatar\n"
+        "📍 Los Alcázares\n"
+        "📍 Torre-Pacheco\n"
+        "📍 Cartagena\n"
+        "📍 Murcia capital solo con salario anual mínimo "
+        "detectado de 24.000 €\n\n"
+        "🚚 Conducción, reparto, almacén, carretilla, logística, "
+        "conserjería, control de accesos, limpieza, mantenimiento, "
+        "producción y puestos relacionados.\n\n"
+        "🌙 Se descartan anuncios que mencionen expresamente "
+        "turnos de noche.\n\n"
+        "Nota: estos filtros dependen de la información publicada "
+        "en cada anuncio."
+    )
+
+
+async def comando_ayuda(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text(
+        "🤖 COMANDOS DEL BOT\n\n"
+        "/start - Activar los avisos automáticos\n"
+        "/buscar - Buscar ofertas ahora\n"
+        "/ofertas - Igual que buscar\n"
+        "/scan - Igual que buscar\n"
+        "/portales - Ver las fuentes consultadas\n"
+        "/preferencias - Ver tus filtros\n"
+        "/parar - Desactivar los avisos\n"
+        "/ayuda - Mostrar esta ayuda"
+    )
+
+
+# ============================================================
+# BUSQUEDA AUTOMATICA
+# ============================================================
+
+async def revisar_nuevas_ofertas(application):
+    suscriptores = obtener_suscriptores()
+
+    if not suscriptores:
+        logger.info("No hay suscriptores; se omite el envio automatico.")
+        return
+
+    ofertas = await buscar_ofertas_validas()
+
+    if not ofertas:
+        logger.info("No se han encontrado ofertas que pasen los filtros.")
+        return
+
+    vistas = ofertas_registradas()
+    primera = primer_arranque()
+
+    if primera:
+        # Primer arranque: enviar solo unas pocas ofertas para evitar
+        # inundar Telegram con anuncios antiguos del canal.
+        seleccion = ofertas[:MAX_OFERTAS_PRIMER_ENVIO]
+
+        logger.info(
+            "Primera consulta: se enviaran hasta %s ofertas",
+            len(seleccion),
+        )
+
+        for chat_id in suscriptores:
+            for oferta in seleccion:
+                try:
+                    await enviar_oferta(application.bot, chat_id, oferta)
+                except Exception:
+                    logger.exception(
+                        "No se pudo enviar una oferta a %s", chat_id
+                    )
+
+        # Registrar tambien las demas ofertas encontradas en esta primera
+        # consulta para no enviarlas una por una en las siguientes rondas.
+        registrar_ofertas([oferta["id"] for oferta in ofertas])
+        marcar_arranque()
+        return
+
+    nuevas = [
+        oferta for oferta in ofertas
+        if oferta["id"] not in vistas
+    ]
+
+    if not nuevas:
+        logger.info("No hay ofertas nuevas.")
+        return
+
+    nuevas = nuevas[:MAX_OFERTAS_POR_ENVIO]
+
+    for chat_id in suscriptores:
+        for oferta in nuevas:
+            try:
+                await enviar_oferta(application.bot, chat_id, oferta)
+                await asyncio.sleep(1)
+            except Exception:
+                logger.exception(
+                    "No se pudo enviar una oferta a %s", chat_id
+                )
+
+    # Registrar los avisos para evitar duplicados en la siguiente consulta.
+    registrar_ofertas([oferta["id"] for oferta in nuevas])
+
+
+async def tarea_automatica(application):
+    await asyncio.sleep(20)
+
+    while True:
+        try:
+            logger.info("Iniciando comprobacion automatica de ofertas.")
+            await revisar_nuevas_ofertas(application)
+
+        except Exception:
+            logger.exception("Error en la comprobacion automatica")
+
+        await asyncio.sleep(INTERVALO_BUSQUEDA)
+
+
+async def preparar_aplicacion(application):
+    application.create_task(tarea_automatica(application))
+
+
+# ============================================================
+# SERVIDOR PARA RENDER
 # ============================================================
 
 @app_web.route("/")
-def inicio_web():
-    return jsonify({
-        "bot": "Bot de empleo San Javier",
-        "estado": "funcionando",
-        "api_configurada": bool(JOA_API_KEY),
-    })
+def inicio():
+    return "Bot de empleo funcionando con RSS gratuitos del SEPE."
 
 
 @app_web.route("/health")
-def estado_web():
-    return jsonify({"estado": "ok"}), 200
+def salud():
+    return {
+        "estado": "ok",
+        "fuente": "RSS SEPE",
+        "creditos_joa": False,
+    }
 
 
 def iniciar_servidor_web():
@@ -183,941 +849,13 @@ def iniciar_servidor_web():
 
 
 # ============================================================
-# UTILIDADES
-# ============================================================
-
-def normalizar(texto):
-    texto = str(texto or "").lower().strip()
-    texto = unicodedata.normalize("NFD", texto)
-
-    texto = "".join(
-        caracter
-        for caracter in texto
-        if unicodedata.category(caracter) != "Mn"
-    )
-
-    # Unifica guiones, comas y otros signos como espacios.
-    texto = re.sub(r"[^a-z0-9]+", " ", texto)
-
-    return " ".join(texto.split())
-
-
-def enlace_google(busqueda):
-    return (
-        "https://www.google.com/search?q="
-        + quote_plus(busqueda)
-    )
-
-
-def enlace_indeed(busqueda):
-    return (
-        "https://es.indeed.com/jobs?q="
-        + quote_plus(busqueda)
-        + "&l="
-        + quote_plus("San Javier, Murcia")
-    )
-
-
-def enlace_infojobs(busqueda):
-    return enlace_google(
-        "site:infojobs.net " + busqueda + " San Javier Murcia"
-    )
-
-
-def ubicacion_oferta(oferta):
-    partes = [
-        oferta.get("location"),
-        oferta.get("city"),
-        oferta.get("region"),
-        oferta.get("state"),
-    ]
-
-    return normalizar(
-        " ".join(str(parte) for parte in partes if parte)
-    )
-
-
-def es_zona_prioritaria(oferta):
-    ubicacion = ubicacion_oferta(oferta)
-
-    return any(
-        zona in ubicacion
-        for zona in ZONAS_PRIORITARIAS
-    )
-
-
-def es_murcia_capital(oferta):
-    ciudad = normalizar(oferta.get("city", ""))
-
-    # Si la API identifica la ciudad, usamos ese dato.
-    if ciudad:
-        return ciudad == "murcia"
-
-    # Si no hay ciudad estructurada, solo aceptamos ubicaciones
-    # cuyo texto comienza por Murcia, evitando interpretar
-    # cualquier localidad de la provincia como la capital.
-    ubicacion = normalizar(oferta.get("location", ""))
-
-    return ubicacion == "murcia" or ubicacion.startswith("murcia ")
-
-
-def salario_minimo_publicado(oferta):
-    valor = oferta.get("salary_min_annual_eur")
-
-    try:
-        if valor is None:
-            return None
-
-        return float(valor)
-
-    except (TypeError, ValueError):
-        return None
-
-
-def es_zona_aceptada(oferta):
-    if es_zona_prioritaria(oferta):
-        return True
-
-    if es_murcia_capital(oferta):
-        salario = salario_minimo_publicado(oferta)
-
-        return (
-            salario is not None
-            and salario >= SALARIO_MINIMO_MURCIA
-        )
-
-    return False
-
-
-# ============================================================
-# FILTRO DE EMPLEOS Y HORARIOS
-# ============================================================
-
-PALABRAS_EMPLEO = [
-    "conductor",
-    "conductora",
-    "repartidor",
-    "repartidora",
-    "reparto",
-    "chofer",
-    "chófer",
-    "furgoneta",
-    "carnet b",
-    "carretillero",
-    "carretillera",
-    "carretilla",
-    "transportista",
-    "conserje",
-    "conserjeria",
-    "control de acceso",
-    "controlador de acceso",
-    "auxiliar de servicios",
-    "mozo de almacen",
-    "moza de almacen",
-    "almacen",
-    "logistica",
-    "operario",
-    "operaria",
-    "mantenimiento",
-    "reponedor",
-    "reponedora",
-    "supermercado",
-    "vigilante",
-    "recepcionista",
-    "limpieza",
-    "limpiador",
-    "limpiadora",
-    "preparador de pedidos",
-    "preparadora de pedidos",
-    "expediciones",
-    "mensajero",
-    "mensajera",
-]
-
-TERMINOS_NOCHE = [
-    "turno de noche",
-    "turno nocturno",
-    "turno noche",
-    "turnos de noche",
-    "turnos nocturnos",
-    "nocturno",
-    "nocturna",
-    "night shift",
-    "overnight",
-    "trabajo nocturno",
-    "jornada nocturna",
-]
-
-
-def es_trabajo_interesante(oferta):
-    titulo = normalizar(oferta.get("title", ""))
-
-    return any(
-        normalizar(palabra) in titulo
-        for palabra in PALABRAS_EMPLEO
-    )
-
-
-def tiene_turno_nocturno(oferta):
-    titulo = normalizar(oferta.get("title", ""))
-    descripcion = normalizar(oferta.get("description", ""))
-
-    texto = titulo + " " + descripcion
-
-    return any(
-        normalizar(termino) in texto
-        for termino in TERMINOS_NOCHE
-    )
-
-
-def fecha_api(fecha_texto):
-    if not fecha_texto:
-        return None
-
-    try:
-        fecha = datetime.fromisoformat(
-            str(fecha_texto).replace("Z", "+00:00")
-        )
-
-        if fecha.tzinfo is None:
-            fecha = fecha.replace(tzinfo=timezone.utc)
-
-        return fecha.astimezone(timezone.utc)
-
-    except (ValueError, TypeError, OverflowError):
-        return None
-
-
-def oferta_sigue_vigente(oferta):
-    estado = normalizar(oferta.get("status", "live"))
-
-    if estado != "live":
-        return False
-
-    fecha_caducidad = fecha_api(oferta.get("expires_at"))
-
-    if fecha_caducidad is not None:
-        if fecha_caducidad < datetime.now(timezone.utc):
-            return False
-
-    return True
-
-
-# ============================================================
-# CONSULTA DE LA API
-# ============================================================
-
-def consultar_api_empleo():
-    if not JOA_API_KEY:
-        raise RuntimeError(
-            "Falta JOA_API_KEY en las variables de Render."
-        )
-
-    # La API busca en título, empresa y ubicación.
-    # Su listado ya viene ordenado por fecha de publicación.
-    # Se mantiene una única consulta para proteger la cuota.
-    consulta_zonas = (
-        '"San Javier" OR '
-        '"San Pedro del Pinatar" OR '
-        '"Los Alcázares" OR '
-        '"Torre-Pacheco" OR '
-        'Cartagena OR Murcia'
-    )
-
-    parametros = urlencode({
-        "country": "ES",
-        "q": consulta_zonas,
-        "limit": LIMITE_API,
-        "include_description": "true",
-    })
-
-    peticion = Request(
-        API_URL + "?" + parametros,
-        headers={
-            "Authorization": "Bearer " + JOA_API_KEY,
-            "Accept": "application/json",
-            "User-Agent": "EmpleoSanJavierBot/2.0",
-        },
-        method="GET",
-    )
-
-    try:
-        with urlopen(peticion, timeout=35) as respuesta:
-            contenido = respuesta.read().decode("utf-8")
-            datos = json.loads(contenido)
-
-    except HTTPError as error:
-        try:
-            detalle = error.read().decode("utf-8")[:500]
-        except Exception:
-            detalle = ""
-
-        logging.error(
-            "Error API JOA HTTP %s: %s",
-            error.code,
-            detalle,
-        )
-
-        if error.code == 401:
-            raise RuntimeError(
-                "JOA ha rechazado la clave. "
-                "Comprueba JOA_API_KEY en Render."
-            )
-
-        if error.code == 402:
-            raise RuntimeError(
-                "JOA indica que se ha alcanzado un límite "
-                "del plan o de registros."
-            )
-
-        if error.code == 403:
-            raise RuntimeError(
-                "JOA ha denegado la consulta. Puede ser un "
-                "problema de permisos o de cuota. Revisa "
-                "el detalle del error en los Logs de Render."
-            )
-
-        if error.code == 422:
-            raise RuntimeError(
-                "JOA no acepta alguno de los parámetros "
-                "de búsqueda. Revisa los Logs de Render."
-            )
-
-        if error.code == 429:
-            raise RuntimeError(
-                "JOA ha limitado temporalmente las consultas."
-            )
-
-        if error.code >= 500:
-            raise RuntimeError(
-                "El servicio de JOA tiene un error temporal "
-                "o no ha podido completar la búsqueda."
-            )
-
-        raise RuntimeError(
-            "JOA ha respondido con el error HTTP "
-            + str(error.code)
-            + "."
-        )
-
-    except (URLError, TimeoutError, OSError) as error:
-        logging.warning("Error de conexión con JOA: %s", error)
-
-        raise RuntimeError(
-            "No se ha podido conectar con la API de empleo."
-        )
-
-    except json.JSONDecodeError:
-        raise RuntimeError(
-            "La API ha devuelto una respuesta que no es JSON válido."
-        )
-
-    if not isinstance(datos, dict):
-        raise RuntimeError(
-            "La API ha devuelto una respuesta inesperada."
-        )
-
-    ofertas = datos.get("data")
-
-    if not isinstance(ofertas, list):
-        raise RuntimeError(
-            "La respuesta de JOA no contiene la lista de ofertas."
-        )
-
-    resultado = []
-
-    for oferta in ofertas:
-        if not isinstance(oferta, dict):
-            continue
-
-        if not oferta_sigue_vigente(oferta):
-            continue
-
-        enlace = str(oferta.get("apply_url") or "").strip()
-
-        if not enlace.startswith(("https://", "http://")):
-            continue
-
-        if not es_zona_aceptada(oferta):
-            continue
-
-        if not es_trabajo_interesante(oferta):
-            continue
-
-        # Solo descartamos horarios nocturnos cuando aparecen
-        # claramente en el título o la descripción disponible.
-        if tiene_turno_nocturno(oferta):
-            continue
-
-        resultado.append(oferta)
-
-    resultado.sort(
-        key=lambda oferta: (
-            fecha_api(oferta.get("posted_at"))
-            or fecha_api(oferta.get("first_seen_at"))
-            or datetime.min.replace(tzinfo=timezone.utc)
-        ),
-        reverse=True,
-    )
-
-    logging.info(
-        "JOA: %s registros recibidos; %s cumplen los filtros.",
-        len(ofertas),
-        len(resultado),
-    )
-
-    return resultado
-
-
-async def buscar_ofertas():
-    return await asyncio.to_thread(consultar_api_empleo)
-
-
-# ============================================================
-# PRESENTACION DE OFERTAS
-# ============================================================
-
-def formatear_fecha(fecha_texto):
-    if not fecha_texto:
-        return "Fecha no indicada"
-
-    fecha = fecha_api(fecha_texto)
-
-    if fecha is None:
-        return str(fecha_texto)
-
-    return fecha.astimezone(
-        ZoneInfo("Europe/Madrid")
-    ).strftime("%d/%m/%Y %H:%M")
-
-
-def numero_espanol(valor):
-    return f"{float(valor):,.0f}".replace(",", ".")
-
-
-def formatear_salario(oferta):
-    minimo_anual = oferta.get("salary_min_annual_eur")
-    maximo = oferta.get("salary_max_annual_eur")
-    origen = normalizar(oferta.get("salary_source", ""))
-
-    try:
-        if minimo_anual is not None:
-            minimo_anual = float(minimo_anual)
-
-            if maximo is not None:
-                maximo = float(maximo)
-
-                if maximo >= minimo_anual:
-                    texto = (
-                        f"{numero_espanol(minimo_anual)}–"
-                        f"{numero_espanol(maximo)} € brutos/año"
-                    )
-                else:
-                    texto = (
-                        f"Desde {numero_espanol(minimo_anual)} "
-                        "€ brutos/año"
-                    )
-            else:
-                texto = (
-                    f"Desde {numero_espanol(minimo_anual)} "
-                    "€ brutos/año"
-                )
-
-            if origen == "parsed description":
-                return "Detectado en el anuncio: " + texto
-
-            return texto
-
-    except (ValueError, TypeError):
-        pass
-
-    # Si no se puede normalizar el salario anual, mostramos
-    # la cifra original solo con su periodo y moneda conocidos.
-    minimo = oferta.get("salary_min")
-    maximo_original = oferta.get("salary_max")
-    moneda = str(oferta.get("salary_currency") or "").upper()
-    periodo = normalizar(oferta.get("salary_period", ""))
-
-    if minimo is not None and moneda:
-        periodos = {
-            "hour": "hora",
-            "day": "día",
-            "week": "semana",
-            "month": "mes",
-            "year": "año",
-        }
-
-        unidad = periodos.get(periodo)
-
-        try:
-            minimo_num = float(minimo)
-
-            if maximo_original is not None:
-                maximo_num = float(maximo_original)
-
-                if maximo_num >= minimo_num:
-                    cifra = (
-                        f"{numero_espanol(minimo_num)}–"
-                        f"{numero_espanol(maximo_num)}"
-                    )
-                else:
-                    cifra = numero_espanol(minimo_num)
-            else:
-                cifra = numero_espanol(minimo_num)
-
-            if unidad:
-                return f"{cifra} {moneda}/{unidad}"
-
-            return f"{cifra} {moneda}"
-
-        except (ValueError, TypeError):
-            pass
-
-    return "Salario no publicado"
-
-
-def identificador_oferta(oferta):
-    identificador = oferta.get("id") or oferta.get("apply_url")
-
-    if not identificador:
-        return None
-
-    return str(identificador)
-
-
-async def enviar_una_oferta(bot, chat_id, oferta):
-    titulo = oferta.get("title") or "Puesto sin título"
-    empresa = oferta.get("company") or "Empresa no indicada"
-
-    ubicacion = (
-        oferta.get("location")
-        or oferta.get("city")
-        or "Ubicación no detallada"
-    )
-
-    fecha = formatear_fecha(
-        oferta.get("posted_at")
-        or oferta.get("first_seen_at")
-    )
-
-    salario = formatear_salario(oferta)
-
-    if es_zona_prioritaria(oferta):
-        zona_texto = "📍 Zona prioritaria"
-    else:
-        zona_texto = "📍 Zona ampliada: Murcia capital"
-
-    texto = (
-        "🆕 OFERTA DE EMPLEO\n\n"
-        f"💼 {titulo}\n"
-        f"🏢 Empresa: {empresa}\n"
-        f"{zona_texto}: {ubicacion}\n"
-        f"💶 Salario: {salario}\n"
-        f"📅 Publicada: {fecha}\n\n"
-        "⚠️ Comprueba el horario, las condiciones "
-        "y que la vacante siga disponible."
-    )
-
-    teclado = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "📩 Ver oferta y solicitar",
-                url=oferta["apply_url"],
-            )
-        ]
-    ])
-
-    await bot.send_message(
-        chat_id=chat_id,
-        text=texto,
-        reply_markup=teclado,
-        disable_web_page_preview=True,
-    )
-
-
-async def enviar_resultados(
-    bot,
-    chat_id,
-    ofertas,
-    solo_nuevas=False,
-):
-    if not ofertas:
-        if not solo_nuevas:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "🔎 No he encontrado ofertas que cumplan "
-                    "los filtros en esta consulta.\n\n"
-                    "📍 Zona prioritaria: San Javier, "
-                    "San Pedro del Pinatar, Los Alcázares, "
-                    "Torre-Pacheco y Cartagena.\n"
-                    "📍 Murcia capital: salario anual "
-                    "normalizado de al menos 24.000 €.\n\n"
-                    "La API tiene una cobertura limitada y "
-                    "el horario no siempre aparece en los anuncios."
-                ),
-            )
-        return
-
-    enviadas = 0
-    pendientes = 0
-
-    for oferta in ofertas:
-        identificador = identificador_oferta(oferta)
-
-        if not identificador:
-            continue
-
-        if oferta_ya_enviada(chat_id, identificador):
-            continue
-
-        pendientes += 1
-
-        if enviadas >= MAX_OFERTAS_TELEGRAM:
-            continue
-
-        try:
-            await enviar_una_oferta(bot, chat_id, oferta)
-
-            marcar_oferta_enviada(chat_id, identificador)
-            enviadas += 1
-
-        except Exception:
-            logging.exception(
-                "No se ha podido enviar la oferta %s",
-                identificador,
-            )
-
-    if enviadas == 0 and pendientes == 0 and not solo_nuevas:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "✅ Ya habías recibido todas las ofertas "
-                "que cumplen los filtros de esta consulta."
-            ),
-        )
-
-    elif enviadas > 0 and pendientes > enviadas and not solo_nuevas:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"📋 Te he enviado {enviadas} ofertas nuevas. "
-                "Hay más resultados, pero he limitado este "
-                "mensaje para no saturar el chat."
-            ),
-        )
-
-
-# ============================================================
-# COMANDOS DE TELEGRAM
-# ============================================================
-
-async def comando_start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    chat_id = update.effective_chat.id
-    guardar_suscriptor(chat_id)
-
-    teclado = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🔎 Buscar ofertas reales",
-                callback_data="buscar",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🌐 Portales de empleo",
-                callback_data="portales",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⚙️ Mis preferencias",
-                callback_data="preferencias",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "❓ Ayuda",
-                callback_data="ayuda",
-            )
-        ],
-    ])
-
-    await update.effective_message.reply_text(
-        "👋 ¡Bienvenida al BOT DE EMPLEO SAN JAVIER!\n\n"
-        "🎯 Buscaré ofertas relacionadas con:\n"
-        "🚚 Conductor y repartidor con carnet B\n"
-        "📦 Carretillero y trabajos de almacén\n"
-        "🏢 Conserje y control de accesos\n"
-        "🔧 Operario, mantenimiento y otros puestos similares\n\n"
-        "📍 PRIORIDAD:\n"
-        "San Javier, San Pedro del Pinatar, Los Alcázares, "
-        "Torre-Pacheco y Cartagena.\n\n"
-        "Murcia capital solo se incluye si la API indica "
-        "un salario anual de al menos 24.000 €.\n\n"
-        "☀️ Intentaré descartar los turnos nocturnos cuando "
-        "se indiquen claramente en el anuncio.\n\n"
-        "Pulsa «Buscar ofertas reales» para empezar.\n\n"
-        "Las alertas automáticas dependen de que Render "
-        "mantenga el servicio activo.",
-        reply_markup=teclado,
-    )
-
-
-async def comando_buscar(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    chat_id = update.effective_chat.id
-    guardar_suscriptor(chat_id)
-
-    mensaje = await update.effective_message.reply_text(
-        "🔎 Consultando ofertas reales de empleo..."
-    )
-
-    try:
-        ofertas = await buscar_ofertas()
-
-        await enviar_resultados(
-            context.bot,
-            chat_id,
-            ofertas,
-        )
-
-    except Exception as error:
-        logging.exception("Error al buscar ofertas")
-
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "⚠️ No he podido consultar las ofertas.\n\n"
-                f"Motivo: {error}"
-            ),
-        )
-
-    try:
-        await mensaje.delete()
-    except Exception:
-        pass
-
-
-async def comando_preferencias(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    await update.effective_message.reply_text(
-        "⚙️ TUS PREFERENCIAS\n\n"
-        "📍 San Javier, San Pedro del Pinatar, Los Alcázares, "
-        "Torre-Pacheco y Cartagena.\n"
-        "📍 Murcia capital: mínimo 24.000 € brutos anuales "
-        "normalizados por la API.\n"
-        "🚗 Carnet de conducir B.\n"
-        "📦 Más de 10 años de experiencia con carretilla.\n"
-        "🏢 Conserjería y control de accesos.\n"
-        "🚚 Conducción, reparto y logística.\n"
-        "☀️ Preferencia por trabajos sin turno de noche.\n"
-        "📅 Disponibilidad los sábados.\n"
-        "💶 Prioridad a mejores condiciones salariales.\n\n"
-        "El salario y el horario pueden no estar indicados "
-        "en el anuncio original."
-    )
-
-
-async def comando_portales(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    teclado = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🚚 Conductor y repartidor",
-                url=enlace_indeed(
-                    "conductor repartidor carnet B"
-                ),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📦 Carretillero y almacén",
-                url=enlace_indeed(
-                    "carretillero almacen"
-                ),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🏢 Conserje y accesos",
-                url=enlace_indeed(
-                    "conserje control accesos"
-                ),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔎 Buscar en InfoJobs",
-                url=enlace_infojobs(
-                    "conductor repartidor carretillero conserje"
-                ),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔎 Buscar en Google",
-                url=enlace_google(
-                    "empleo San Javier Cartagena Murcia "
-                    "conductor repartidor carretillero"
-                ),
-            )
-        ],
-    ])
-
-    await update.effective_message.reply_text(
-        "🌐 BÚSQUEDAS COMPLEMENTARIAS\n\n"
-        "Estos enlaces abren portales de empleo. Comprueba "
-        "la ubicación, el salario, el horario y que la oferta "
-        "siga vigente.",
-        reply_markup=teclado,
-    )
-
-
-async def comando_ayuda(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    await update.effective_message.reply_text(
-        "❓ AYUDA\n\n"
-        "/start — Abrir el menú y suscribirte.\n"
-        "/buscar — Consultar ofertas reales.\n"
-        "/ofertas — Alias de buscar.\n"
-        "/portales — Abrir portales de empleo.\n"
-        "/preferencias — Ver tus preferencias.\n"
-        "/ayuda — Mostrar esta ayuda.\n\n"
-        "El bot hace una comprobación al arrancar y después "
-        "intenta buscar una vez al día mientras Render "
-        "mantenga el proceso activo.\n\n"
-        "La búsqueda manual también consume registros "
-        "de la cuota de JOA."
-    )
-
-
-# ============================================================
-# BOTONES
-# ============================================================
-
-async def gestionar_boton(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    consulta = update.callback_query
-    await consulta.answer()
-
-    dato = consulta.data
-
-    if dato == "buscar":
-        chat_id = consulta.message.chat_id
-        guardar_suscriptor(chat_id)
-
-        await consulta.message.reply_text(
-            "🔎 Consultando las ofertas reales..."
-        )
-
-        try:
-            ofertas = await buscar_ofertas()
-
-            await enviar_resultados(
-                context.bot,
-                chat_id,
-                ofertas,
-            )
-
-        except Exception as error:
-            logging.exception("Error en el botón de búsqueda")
-
-            await consulta.message.reply_text(
-                "⚠️ No he podido consultar la API.\n"
-                f"Motivo: {error}"
-            )
-
-    elif dato == "portales":
-        await comando_portales(update, context)
-
-    elif dato == "preferencias":
-        await comando_preferencias(update, context)
-
-    elif dato == "ayuda":
-        await comando_ayuda(update, context)
-
-
-# ============================================================
-# ALERTAS AUTOMATICAS
-# ============================================================
-
-async def tarea_alertas(application):
-    # Primera consulta breve después de arrancar.
-    await asyncio.sleep(ESPERA_PRIMERA_ALERTA)
-
-    while True:
-        if suscriptores:
-            try:
-                ofertas = await buscar_ofertas()
-
-                for chat_id in list(suscriptores):
-                    try:
-                        await enviar_resultados(
-                            application.bot,
-                            chat_id,
-                            ofertas,
-                            solo_nuevas=True,
-                        )
-
-                    except Exception:
-                        logging.exception(
-                            "Error enviando alerta al chat %s",
-                            chat_id,
-                        )
-
-            except Exception:
-                logging.exception(
-                    "Error en la consulta automática de empleo"
-                )
-
-        else:
-            logging.info(
-                "No hay chats suscritos; se omite la consulta "
-                "para no consumir cuota innecesariamente."
-            )
-
-        await asyncio.sleep(INTERVALO_ALERTAS)
-
-
-async def al_iniciar(application):
-    application.create_task(
-        tarea_alertas(application)
-    )
-
-    logging.info(
-        "Alertas automáticas preparadas: primera consulta "
-        "en %s segundos.",
-        ESPERA_PRIMERA_ALERTA,
-    )
-
-
-# ============================================================
-# ARRANQUE
+# INICIO
 # ============================================================
 
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError(
-            "Falta TELEGRAM_TOKEN en Render."
-        )
-
-    if not JOA_API_KEY:
-        raise RuntimeError(
-            "Falta JOA_API_KEY en Render."
+            "Falta TELEGRAM_TOKEN en las variables de entorno de Render."
         )
 
     inicializar_bd()
@@ -1127,26 +865,27 @@ def main():
         daemon=True,
     ).start()
 
-    bot = (
+    aplicacion = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
-        .post_init(al_iniciar)
+        .post_init(preparar_aplicacion)
         .build()
     )
 
-    bot.add_handler(CommandHandler("start", comando_start))
-    bot.add_handler(CommandHandler("buscar", comando_buscar))
-    bot.add_handler(CommandHandler("ofertas", comando_buscar))
-    bot.add_handler(CommandHandler("portales", comando_portales))
-    bot.add_handler(
-        CommandHandler("preferencias", comando_preferencias)
-    )
-    bot.add_handler(CommandHandler("ayuda", comando_ayuda))
-    bot.add_handler(CallbackQueryHandler(gestionar_boton))
+    aplicacion.add_handler(CommandHandler("start", comando_start))
+    aplicacion.add_handler(CommandHandler("buscar", comando_buscar))
+    aplicacion.add_handler(CommandHandler("ofertas", comando_buscar))
+    aplicacion.add_handler(CommandHandler("scan", comando_buscar))
+    aplicacion.add_handler(CommandHandler("portales", comando_portales))
+    aplicacion.add_handler(CommandHandler("preferencias", comando_preferencias))
+    aplicacion.add_handler(CommandHandler("parar", comando_parar))
+    aplicacion.add_handler(CommandHandler("ayuda", comando_ayuda))
 
-    logging.info("Bot de empleo San Javier iniciado.")
+    logger.info("Bot de empleo iniciado.")
+    logger.info("Fuente de ofertas: RSS oficiales del SEPE.")
+    logger.info("Creditos de JOA: no utilizados.")
 
-    bot.run_polling(drop_pending_updates=True)
+    aplicacion.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
