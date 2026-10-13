@@ -319,6 +319,31 @@ def normalizar(texto):
     return texto.translate(str.maketrans("áéíóúü", "aeiouu"))
 
 
+def es_enlace_listado_generico(url):
+    """Evita guardar páginas de búsqueda/categoría como si fueran vacantes."""
+    parsed = urlparse(url)
+    ruta = normalizar(parsed.path).rstrip("/")
+    dominio = parsed.netloc.lower().replace("www.", "")
+
+    # En JobToday, /trabajos-... son categorías/listados, no fichas individuales.
+    if "jobtoday.com" in dominio and (
+        "/trabajos-" in ruta or ruta.endswith("/trabajos")
+    ):
+        return True
+
+    # Páginas de resultados de Indeed.
+    if "indeed." in dominio and (
+        "/q-" in ruta or "/ofertas-en-" in ruta or "/jobs" == ruta
+    ):
+        return True
+
+    # Páginas iniciales/categorías de los portales que usamos como fuente.
+    if ruta in ("/empleo", "/es/ofertas-de-empleo/carretillerosas-zona-san-javier"):
+        return True
+
+    return False
+
+
 def descargar_pagina(url):
     peticion = Request(
         url,
@@ -636,6 +661,9 @@ async def recoger_enlaces_listado():
                     continue
                 if dominio not in urlparse(url_pagina).netloc.lower() and "indeed." not in dominio:
                     continue
+                # No tratar una categoría o página de resultados como una vacante.
+                if es_enlace_listado_generico(url):
+                    continue
                 if url == url_pagina or url in fichas:
                     continue
                 if any(x in url.lower() for x in ("login", "signin", "register", "politica", "privacidad")):
@@ -652,6 +680,10 @@ async def recoger_enlaces_listado():
 
 
 def extraer_detalle_externo(url, titulo_listado):
+    if es_enlace_listado_generico(url):
+        logger.info("Descartada página genérica de búsqueda: %s", url)
+        return None
+
     html = descargar_pagina(url)
     lector = LectorHTML()
     lector.feed(html)
