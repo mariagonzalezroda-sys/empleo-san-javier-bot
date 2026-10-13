@@ -498,6 +498,24 @@ def extraer_localidad(texto):
     return ""
 
 
+def extraer_salario_hora(texto):
+    # Acepta formatos habituales: 9,55-10,55 €/hora o 11,48 euros/hora.
+    texto = normalizar(texto).replace(" ", "")
+    patrones = [
+        r"(\d{1,2}[,.]\d{2})[-–](\d{1,2}[,.]\d{2})€?/(?:hora|h)",
+        r"(\d{1,2}[,.]\d{2})€?/(?:hora|h)",
+        r"(\d{1,2}[,.]\d{2})euros?/(?:hora|h)",
+    ]
+    for patron in patrones:
+        m = re.search(patron, texto, re.IGNORECASE)
+        if m:
+            valores = [x.replace(",", ".") for x in m.groups() if x]
+            if len(valores) == 2:
+                return f"{valores[0]}–{valores[1]} € brutos/hora"
+            return f"{valores[0]} € brutos/hora"
+    return None
+
+
 def extraer_salario_anual(texto):
     texto = normalizar(texto)
     patrones = [
@@ -741,7 +759,12 @@ def extraer_detalle_externo(url, titulo_listado):
     if not titulo_interesante(titulo_listado):
         return None
 
-    # Localidad: no se aceptan ofertas si no aparece claramente una zona permitida.
+    # No aceptar montajes que en realidad exigen soldadura especializada.
+    if re.search(r"\b(?:soldadura|soldador|soldadora|hilo y electrodo|soldadura tig|soldadura mig|soldadura mag)\b", combinado):
+        return None
+
+    # La localidad se decide primero por el título y el inicio de la ficha.
+    # Buscar en toda la página podía asignar Cartagena por una mención secundaria.
     zonas = [
         ("san javier", "San Javier"),
         ("san pedro del pinatar", "San Pedro del Pinatar"),
@@ -750,7 +773,15 @@ def extraer_detalle_externo(url, titulo_listado):
         ("torre pacheco", "Torre-Pacheco"),
         ("cartagena", "Cartagena"),
     ]
-    zona = next((nombre for clave, nombre in zonas if clave in combinado), None)
+    texto_ubicacion = normalizar(titulo_listado + " " + texto[:700])
+    zona = next((nombre for clave, nombre in zonas if clave in texto_ubicacion), None)
+
+    # Espinardo y Murcia capital quedan fuera salvo que se confirme un salario
+    # anual bruto de al menos 24.000 euros.
+    if not zona and re.search(r"\b(?:espinardo|murcia)\b", texto_ubicacion):
+        salario_capital = extraer_salario_anual(texto)
+        if salario_capital is not None and salario_capital >= SALARIO_BRUTO_REFERENCIA:
+            zona = "Murcia capital"
     if not zona:
         return None
 
@@ -995,20 +1026,25 @@ def crear_mensaje(oferta):
     fin = oferta["fin"].strftime("%d/%m/%Y") if oferta.get("fin") else "Consultar vigencia en el portal"
 
     salario = extraer_salario_anual(oferta["texto"])
+    salario_hora = extraer_salario_hora(oferta["texto"])
 
-    if salario is None:
+    if salario is not None:
+        salario_texto = f"{salario:,} € brutos/año".replace(",", ".")
+        aviso_salario = (
+            "ℹ️ El salario bruto no equivale al neto. "
+            "Confirma el neto y el número de pagas."
+        )
+    elif salario_hora is not None:
+        salario_texto = salario_hora
+        aviso_salario = (
+            "⚠️ Es salario bruto por hora; el neto mensual depende "
+            "de las horas, pagas y retenciones."
+        )
+    else:
         salario_texto = "No publicado"
         aviso_salario = (
             "⚠️ No se puede comprobar si alcanza los 1.500 € "
             "netos al mes. Consulta el sueldo antes de aceptar."
-        )
-    else:
-        salario_texto = (
-            f"{salario:,} € brutos/año".replace(",", ".")
-        )
-        aviso_salario = (
-            "ℹ️ El salario bruto no equivale al neto. "
-            "Confirma el neto y el número de pagas."
         )
 
     requisitos = re.search(
