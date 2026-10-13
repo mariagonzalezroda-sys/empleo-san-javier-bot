@@ -417,6 +417,10 @@ def titulo_interesante(titulo):
     if not t or any(normalizar(p) in t for p in TITULOS_EXCLUIDOS):
         return False
 
+    # Algunos portales escriben el género con barra: "mozo/a de almacén".
+    if "mozo/a de almacen" in t or "operario/a de almacen" in t:
+        return True
+
     # Excluir cargos de responsabilidad o perfiles técnicos especializados.
     excluidos_especializados = (
         "jefe de produccion", "jefa de produccion",
@@ -779,15 +783,102 @@ def extraer_detalle_externo(url, titulo_listado):
     }
 
 
+def extraer_ofertas_activa():
+    """
+    Activa San Javier publica las vacantes dentro del texto de una sola página,
+    no como enlaces individuales con el título de cada puesto. Se extraen esas
+    fichas de texto para que no se queden fuera del bot.
+    """
+    url = "https://activa.sanjavier.es/empleo"
+    html = descargar_pagina(url)
+    lector = LectorHTML()
+    lector.feed(html)
+    texto = lector.texto_completo()
+    partes = re.split(r"\\s+DESCRIPCION DEL PUESTO:\\s*", texto, flags=re.IGNORECASE)
+    ofertas = []
+
+    for indice in range(1, len(partes)):
+        prefijo = partes[indice - 1]
+        titulo = prefijo.rsplit("SOLICITAR INSCRIPCIÓN", 1)[-1]
+        if indice == 1:
+            titulo = titulo.rsplit("Empleo", 1)[-1]
+        titulo = " ".join(titulo.split()).strip(" :-")
+
+        bloque = partes[indice]
+        # El bloque de una oferta termina en su fecha de actualización.
+        bloque_actual = re.split(
+            r"Actualización de la oferta de empleo:",
+            bloque,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        fecha_match = re.search(
+            r"Actualización de la oferta de empleo:\\s*(\\d{1,2} de [a-záéíóú]+ de \\d{4}|\\d{1,2}/\\d{1,2}/\\d{4})",
+            bloque,
+            re.IGNORECASE,
+        )
+        if not titulo_interesante(titulo):
+            continue
+
+        combinado = normalizar(titulo + " " + bloque_actual)
+        zonas = [
+            ("san javier", "San Javier"),
+            ("san pedro del pinatar", "San Pedro del Pinatar"),
+            ("los alcazares", "Los Alcázares"),
+            ("torre-pacheco", "Torre-Pacheco"),
+            ("torre pacheco", "Torre-Pacheco"),
+            ("cartagena", "Cartagena"),
+        ]
+        zona = next((nombre for clave, nombre in zonas if clave in combinado), None)
+        if not zona:
+            continue
+        if any(normalizar(frase) in combinado for frase in FRASES_NOCHE):
+            continue
+        if re.search(
+            r"carnet(?: de conducir)?\\s*(?:c\\+e|c1|c|d|adr)|"
+            r"permiso de conducir\\s*(?:c\\+e|c1|c|d)|cap en vigor",
+            combinado,
+        ):
+            continue
+
+        inicio = None
+        if fecha_match:
+            fecha_txt = fecha_match.group(1)
+            try:
+                if "/" in fecha_txt:
+                    inicio = fecha_es(fecha_txt)
+                else:
+                    inicio = datetime.strptime(fecha_txt.lower(), "%d de %B de %Y").date()
+            except ValueError:
+                inicio = None
+
+        identificador = hashlib.sha256(
+            (titulo + "|" + zona + "|" + (fecha_match.group(1) if fecha_match else "")).encode("utf-8")
+        ).hexdigest()
+        ofertas.append({
+            "id": identificador,
+            "titulo": titulo,
+            "zona": zona,
+            "url": url,
+            "inicio": inicio,
+            "fin": None,
+            "texto": bloque_actual,
+        })
+
+    return ofertas
+
+
 async def consultar_ofertas():
     logger.info("Iniciando consulta de ofertas multifuente.")
+    ofertas_activa = await asyncio.to_thread(extraer_ofertas_activa)
+    logger.info("Activa San Javier: %s ofertas compatibles extraídas del texto.", len(ofertas_activa))
     enlaces = await recoger_enlaces_listado()
     if not enlaces:
         logger.warning("Ningún portal ha devuelto enlaces compatibles.")
         return []
 
     enlaces.sort(key=lambda elemento: 0 if titulo_interesante(elemento[1]) else 1)
-    resultados = []
+    resultados = list(ofertas_activa)
     conteo_fuente = {}
     fallos_fuente = {}
 
