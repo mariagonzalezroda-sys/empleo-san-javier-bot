@@ -752,7 +752,7 @@ async def comando_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📍 Murcia capital: solo con salario bruto publicado "
         "de referencia de al menos 22.000 €/año.\n"
         "💶 Objetivo aproximado: 1.500 € netos al mes.\n"
-        "🧹 Limpieza y administración agrícola descartadas.\n"
+        "🧹 Limpieza, mecánica y administración agrícola descartadas.\n"
         "🌙 Sin ofertas que indiquen expresamente turno nocturno.\n\n"
         "/buscar - Buscar ofertas nuevas\n"
         "/preferencias - Ver filtros\n"
