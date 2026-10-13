@@ -95,6 +95,10 @@ TITULOS_EXCLUIDOS = [
     "técnico instalador", "técnica instaladora",
     "vigilante de seguridad",
     "mecanico", "mecanica", "mecánico", "mecánica",
+    "jefe de produccion", "jefa de produccion",
+    "tecnico de produccion", "tecnica de produccion",
+    "técnico de producción", "técnica de producción",
+    "director de produccion", "directora de produccion",
 ]
 
 FRASES_NOCHE = [
@@ -159,6 +163,14 @@ def inicializar_db():
                 texto TEXT,
                 actualizada TEXT NOT NULL
             )
+        """)
+        # Limpia de la base las páginas de categoría que versiones anteriores
+        # guardaron por error como si fueran ofertas individuales.
+        conexion.execute("""
+            DELETE FROM ofertas_guardadas
+            WHERE lower(url) LIKE '%jobtoday.com/es/trabajos-%'
+               OR lower(url) LIKE '%indeed.%/q-%'
+               OR lower(url) LIKE '%indeed.%/ofertas-en-%'
         """)
 
 
