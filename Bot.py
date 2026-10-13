@@ -873,8 +873,8 @@ async def consultar_ofertas():
     ofertas_activa = await asyncio.to_thread(extraer_ofertas_activa)
     logger.info("Activa San Javier: %s ofertas compatibles extraídas del texto.", len(ofertas_activa))
     enlaces = await recoger_enlaces_listado()
-    if not enlaces:
-        logger.warning("Ningún portal ha devuelto enlaces compatibles.")
+    if not enlaces and not ofertas_activa:
+        logger.warning("Ningún portal ha devuelto ofertas compatibles.")
         return []
 
     enlaces.sort(key=lambda elemento: 0 if titulo_interesante(elemento[1]) else 1)
