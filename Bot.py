@@ -38,6 +38,15 @@ URL_LISTADO = (
     "?botonNavegacion=Enviar&modo=continuar&provincia=30"
 )
 
+# Fuentes complementarias gratuitas: páginas públicas de ofertas.
+URLS_EXTERNAS = [
+    "https://activa.sanjavier.es/empleo",
+    "https://www.interempleo.es/es/ofertas-de-empleo/carretillerosas-zona-san-javier",
+    "https://es.indeed.com/jobs?q=conductor+repartidor+carretillero+mozo+almacen&l=San+Javier%2C+Murcia",
+    "https://es.indeed.com/jobs?q=operario+produccion+preparacion+pedidos&l=Torre-Pacheco%2C+Murcia",
+    "https://jobtoday.com/es/trabajos-transporte-y-reparto/san-javier",
+]
+
 ZONAS = {
     "san javier": "San Javier",
     "san pedro del pinatar": "San Pedro del Pinatar",
@@ -543,11 +552,9 @@ async def recoger_enlaces_listado():
         visitadas.add(url_pagina)
 
         try:
-            html = await asyncio.to_thread(
-                descargar_pagina, url_pagina
-            )
+            html = await asyncio.to_thread(descargar_pagina, url_pagina)
         except Exception:
-            logger.exception("Error al consultar una página del listado.")
+            logger.warning("No se pudo consultar listado oficial: %s", url_pagina)
             continue
 
         lector = LectorHTML()
@@ -555,67 +562,126 @@ async def recoger_enlaces_listado():
 
         for href, titulo in lector.enlaces:
             url = urljoin(url_pagina, href)
-
             if "detalleOferta.do" in href:
-                fichas[url] = titulo
+                fichas[url] = {"titulo": titulo, "fuente": "SEF"}
             elif es_pagina_resultados(href, url_pagina):
                 if url not in visitadas and url not in pendientes:
                     pendientes.append(url)
 
-        logger.info(
-            "Listado %s/%s; fichas acumuladas: %s",
-            len(visitadas), MAX_PAGINAS, len(fichas),
-        )
+        logger.info("Listado oficial %s/%s; fichas: %s",
+                    len(visitadas), MAX_PAGINAS, len(fichas))
 
-    return list(fichas.items())
+    # Añadir enlaces de portales gratuitos; cada página se procesa por separado.
+    for url_pagina in URLS_EXTERNAS:
+        try:
+            html = await asyncio.to_thread(descargar_pagina, url_pagina)
+            lector = LectorHTML()
+            lector.feed(html)
+            encontrados = 0
+            for href, titulo in lector.enlaces:
+                titulo_limpio = " ".join((titulo or "").split())
+                url = urljoin(url_pagina, href)
+                dominio = urlparse(url).netloc.lower()
+                if not titulo_limpio or not titulo_interesante(titulo_limpio):
+                    continue
+                if dominio not in urlparse(url_pagina).netloc.lower() and "indeed." not in dominio:
+                    continue
+                if url == url_pagina or url in fichas:
+                    continue
+                if any(x in url.lower() for x in ("login", "signin", "register", "politica", "privacidad")):
+                    continue
+                if len(titulo_limpio) > 120:
+                    continue
+                fichas[url] = {"titulo": titulo_limpio, "fuente": "externa"}
+                encontrados += 1
+            logger.info("Fuente externa %s: %s enlaces compatibles", url_pagina, encontrados)
+        except Exception as exc:
+            logger.warning("Fuente externa no disponible %s: %s", url_pagina, exc)
+
+    return [(url, datos["titulo"], datos["fuente"]) for url, datos in fichas.items()]
+
+
+def extraer_detalle_externo(url, titulo_listado):
+    html = descargar_pagina(url)
+    lector = LectorHTML()
+    lector.feed(html)
+    texto = lector.texto_completo()
+    combinado = normalizar(titulo_listado + " " + texto)
+
+    if not titulo_interesante(titulo_listado):
+        return None
+
+    # Localidad: no se aceptan ofertas si no aparece claramente una zona permitida.
+    zonas = [
+        ("san javier", "San Javier"),
+        ("san pedro del pinatar", "San Pedro del Pinatar"),
+        ("los alcazares", "Los Alcázares"),
+        ("torre-pacheco", "Torre-Pacheco"),
+        ("torre pacheco", "Torre-Pacheco"),
+        ("cartagena", "Cartagena"),
+    ]
+    zona = next((nombre for clave, nombre in zonas if clave in combinado), None)
+    if not zona:
+        return None
+
+    if any(normalizar(frase) in combinado for frase in FRASES_NOCHE):
+        return None
+    if "tip en vigor" in combinado:
+        return None
+    if re.search(r"desemplead[oa]s? de larga duracion|parad[oa]s? de larga duracion|"
+                 r"estar desemplead[oa]s?|inscrit[oa]s? como demandante de empleo.{0,100}"
+                 r"(?:obligatori|imprescindible|requisito)", combinado):
+        return None
+
+    inicio = None
+    coincidencia = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", texto)
+    if coincidencia:
+        try:
+            inicio = date(int(coincidencia.group(3)), int(coincidencia.group(2)),
+                          int(coincidencia.group(1)))
+        except ValueError:
+            inicio = None
+
+    # El enlace se mantiene para comprobar que la oferta sigue activa.
+    identificador = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    return {
+        "id": identificador,
+        "titulo": titulo_listado,
+        "zona": zona,
+        "url": url,
+        "inicio": inicio,
+        "fin": None,
+        "texto": texto,
+    }
 
 
 async def consultar_ofertas():
-    logger.info("Iniciando consulta de ofertas.")
-
+    logger.info("Iniciando consulta de ofertas multifuente.")
     enlaces = await recoger_enlaces_listado()
-
     if not enlaces:
-        logger.warning("El portal no ha devuelto fichas.")
+        logger.warning("Ningún portal ha devuelto enlaces compatibles.")
         return []
 
-    # Procesar primero los títulos que parecen compatibles.
-    enlaces.sort(
-        key=lambda elemento: (
-            0 if titulo_interesante(elemento[1]) else 1
-        )
-    )
-
+    enlaces.sort(key=lambda elemento: 0 if titulo_interesante(elemento[1]) else 1)
     resultados = []
 
-    for url, titulo in enlaces[:MAX_CANDIDATOS]:
+    for url, titulo, fuente in enlaces[:MAX_CANDIDATOS]:
         try:
-            oferta = await asyncio.to_thread(
-                extraer_detalle, url, titulo
-            )
+            if fuente == "SEF":
+                oferta = await asyncio.to_thread(extraer_detalle, url, titulo)
+            else:
+                oferta = await asyncio.to_thread(extraer_detalle_externo, url, titulo)
             if oferta:
                 resultados.append(oferta)
         except Exception:
-            logger.exception("Error leyendo una ficha: %s", titulo)
+            logger.warning("No se pudo leer la oferta %s", url, exc_info=True)
+        await asyncio.sleep(0.15)
 
-        await asyncio.sleep(0.2)
-
-    unicas = {}
-
-    for oferta in resultados:
-        unicas[oferta["id"]] = oferta
-
+    unicas = {oferta["id"]: oferta for oferta in resultados}
     ofertas = list(unicas.values())
-    ofertas.sort(
-        key=lambda oferta: oferta["inicio"] or date.min,
-        reverse=True,
-    )
-
-    logger.info(
-        "Consulta terminada: fichas=%s; ofertas válidas=%s.",
-        min(len(enlaces), MAX_CANDIDATOS), len(ofertas),
-    )
-
+    ofertas.sort(key=lambda oferta: oferta["inicio"] or date.min, reverse=True)
+    logger.info("Consulta multifuente terminada: enlaces=%s; ofertas válidas=%s.",
+                min(len(enlaces), MAX_CANDIDATOS), len(ofertas))
     return ofertas
 
 
@@ -628,7 +694,7 @@ def crear_mensaje(oferta):
         oferta["inicio"].strftime("%d/%m/%Y")
         if oferta["inicio"] else "No indicada"
     )
-    fin = oferta["fin"].strftime("%d/%m/%Y")
+    fin = oferta["fin"].strftime("%d/%m/%Y") if oferta.get("fin") else "Consultar vigencia en el portal"
 
     salario = extraer_salario_anual(oferta["texto"])
 
