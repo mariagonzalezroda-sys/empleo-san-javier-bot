@@ -794,15 +794,21 @@ def extraer_ofertas_activa():
     lector = LectorHTML()
     lector.feed(html)
     texto = lector.texto_completo()
-    partes = re.split(r"\\s+DESCRIPCION DEL PUESTO:\\s*", texto, flags=re.IGNORECASE)
+    partes = re.split(r"\s+DESCRIPCION DEL PUESTO:\s*", texto, flags=re.IGNORECASE)
     ofertas = []
 
     for indice in range(1, len(partes)):
         prefijo = partes[indice - 1]
         titulo = prefijo.rsplit("SOLICITAR INSCRIPCIÓN", 1)[-1]
-        if indice == 1:
-            titulo = titulo.rsplit("Empleo", 1)[-1]
+        # El título suele ser el último encabezado antes de la descripción.
         titulo = " ".join(titulo.split()).strip(" :-")
+        if indice == 1:
+            coincidencia_titulo = re.search(
+                r"([A-ZÁÉÍÓÚÜÑ0-9 /().-]{4,90})$",
+                titulo,
+            )
+            if coincidencia_titulo:
+                titulo = coincidencia_titulo.group(1).strip(" :-")
 
         bloque = partes[indice]
         # El bloque de una oferta termina en su fecha de actualización.
@@ -813,7 +819,7 @@ def extraer_ofertas_activa():
             flags=re.IGNORECASE,
         )[0]
         fecha_match = re.search(
-            r"Actualización de la oferta de empleo:\\s*(\\d{1,2} de [a-záéíóú]+ de \\d{4}|\\d{1,2}/\\d{1,2}/\\d{4})",
+            r"Actualización de la oferta de empleo:\s*(\d{1,2} de [a-záéíóú]+ de \d{4}|\d{1,2}/\d{1,2}/\d{4})",
             bloque,
             re.IGNORECASE,
         )
@@ -835,8 +841,8 @@ def extraer_ofertas_activa():
         if any(normalizar(frase) in combinado for frase in FRASES_NOCHE):
             continue
         if re.search(
-            r"carnet(?: de conducir)?\\s*(?:c\\+e|c1|c|d|adr)|"
-            r"permiso de conducir\\s*(?:c\\+e|c1|c|d)|cap en vigor",
+            r"carnet(?: de conducir)?\s*(?:c\+e|c1|c|d|adr)|"
+            r"permiso de conducir\s*(?:c\+e|c1|c|d)|cap en vigor",
             combinado,
         ):
             continue
@@ -870,8 +876,12 @@ def extraer_ofertas_activa():
 
 async def consultar_ofertas():
     logger.info("Iniciando consulta de ofertas multifuente.")
-    ofertas_activa = await asyncio.to_thread(extraer_ofertas_activa)
-    logger.info("Activa San Javier: %s ofertas compatibles extraídas del texto.", len(ofertas_activa))
+    try:
+        ofertas_activa = await asyncio.to_thread(extraer_ofertas_activa)
+        logger.info("Activa San Javier: %s ofertas compatibles extraídas del texto.", len(ofertas_activa))
+    except Exception:
+        logger.exception("No se pudieron extraer las ofertas de Activa San Javier.")
+        ofertas_activa = []
     enlaces = await recoger_enlaces_listado()
     if not enlaces and not ofertas_activa:
         logger.warning("Ningún portal ha devuelto ofertas compatibles.")
