@@ -42,9 +42,8 @@ URL_LISTADO = (
 URLS_EXTERNAS = [
     "https://activa.sanjavier.es/empleo",
     "https://www.interempleo.es/es/ofertas-de-empleo/carretillerosas-zona-san-javier",
-    "https://es.indeed.com/Ofertas-en-San-Javier-%2C-Murcia",
-    "https://es.indeed.com/q-carretillero-l-torre-pacheco%2C-murcia-provincia-empleos.html",
-    "https://es.indeed.com/q-almac%C3%A9n-y-empaquetado-l-cartagena%2C-murcia-provincia-empleos.html",
+    # Indeed devuelve HTTP 403 desde el servidor; se conserva fuera de la consulta
+    # automática para evitar perder tiempo en cada búsqueda.
     "https://jobtoday.com/es/trabajos-transporte-y-reparto/san-javier",
 ]
 
@@ -413,18 +412,46 @@ def identificador_estable(url, texto=""):
 # ============================================================
 
 def titulo_interesante(titulo):
-    t = normalizar(titulo)
+    t = normalizar(titulo).strip()
 
-    if any(normalizar(p) in t for p in TITULOS_EXCLUIDOS):
+    if not t or any(normalizar(p) in t for p in TITULOS_EXCLUIDOS):
         return False
 
-    # No admitir títulos administrativos genéricos.
+    # Excluir cargos de responsabilidad o perfiles técnicos especializados.
+    excluidos_especializados = (
+        "jefe de produccion", "jefa de produccion",
+        "tecnico de produccion", "tecnica de produccion",
+        "director de produccion", "directora de produccion",
+        "responsable de produccion", "encargado de produccion",
+        "encargada de produccion", "supervisor de produccion",
+        "supervisora de produccion", "ingeniero de produccion",
+        "ingeniera de produccion",
+    )
+    if any(puesto in t for puesto in excluidos_especializados):
+        return False
+
     if "administrativ" in t:
         return False
 
-    # Evitar que una mención secundaria al almacén haga válida
-    # una oferta cuyo puesto principal no corresponde.
-    return any(normalizar(puesto) in t for puesto in PUESTOS)
+    # No usar palabras genéricas aisladas como "producción" o "operario"
+    # para aceptar títulos de puestos que no son realmente compatibles.
+    palabras_demasiado_genericas = {
+        "produccion", "operario", "operaria", "almacen", "reparto",
+        "logistica", "fabrica", "supermercado",
+    }
+    puestos_especificos = [
+        normalizar(p) for p in PUESTOS
+        if normalizar(p) not in palabras_demasiado_genericas
+    ]
+    if any(puesto in t for puesto in puestos_especificos):
+        return True
+
+    # Algunos títulos sencillos sí son válidos por sí solos.
+    return t in {
+        "operario", "operaria", "mozo de almacen", "moza de almacen",
+        "auxiliar de almacen", "operario de almacen", "operaria de almacen",
+        "reparto", "logistica", "almacen",
+    }
 
 
 def extraer_fechas(texto):
@@ -824,6 +851,7 @@ async def comando_diagnostico(update: Update, context: ContextTypes.DEFAULT_TYPE
             candidatos = [
                 (href, titulo) for href, titulo in enlaces
                 if titulo_interesante(titulo)
+                and not es_enlace_listado_generico(urljoin(url, href))
             ]
             texto = lector.texto_completo().lower()
             bloqueos = any(p in texto for p in (
