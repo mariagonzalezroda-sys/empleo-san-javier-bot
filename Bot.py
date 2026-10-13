@@ -148,6 +148,18 @@ def inicializar_db():
                 valor TEXT
             )
         """)
+        conexion.execute("""
+            CREATE TABLE IF NOT EXISTS ofertas_guardadas (
+                id TEXT PRIMARY KEY,
+                titulo TEXT NOT NULL,
+                zona TEXT,
+                url TEXT NOT NULL,
+                inicio TEXT,
+                fin TEXT,
+                texto TEXT,
+                actualizada TEXT NOT NULL
+            )
+        """)
 
 
 def suscriptores():
@@ -186,6 +198,43 @@ def guardar_enviada(identificador):
             "INSERT OR IGNORE INTO enviadas(id, fecha) VALUES (?, ?)",
             (identificador, datetime.now().isoformat()),
         )
+
+
+def guardar_ofertas(ofertas):
+    ahora = datetime.now().isoformat()
+    filas = []
+    for oferta in ofertas:
+        inicio = oferta["inicio"].isoformat() if oferta.get("inicio") else None
+        fin = oferta["fin"].isoformat() if oferta.get("fin") else None
+        filas.append((
+            oferta["id"], oferta["titulo"], oferta.get("zona", ""),
+            oferta["url"], inicio, fin, oferta.get("texto", ""), ahora,
+        ))
+    if filas:
+        with db() as conexion:
+            conexion.executemany("""
+                INSERT INTO ofertas_guardadas
+                (id, titulo, zona, url, inicio, fin, texto, actualizada)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    titulo=excluded.titulo,
+                    zona=excluded.zona,
+                    url=excluded.url,
+                    inicio=excluded.inicio,
+                    fin=excluded.fin,
+                    texto=excluded.texto,
+                    actualizada=excluded.actualizada
+            """, filas)
+
+
+def obtener_ultimas_ofertas(limite=10):
+    with db() as conexion:
+        return conexion.execute("""
+            SELECT titulo, zona, url, inicio, fin, texto, actualizada
+            FROM ofertas_guardadas
+            ORDER BY actualizada DESC
+            LIMIT ?
+        """, (limite,)).fetchall()
 
 
 def primera_consulta():
@@ -702,6 +751,7 @@ async def consultar_ofertas():
     ofertas.sort(key=lambda oferta: oferta["inicio"] or date.min, reverse=True)
     logger.info("Consulta multifuente terminada: enlaces=%s; ofertas válidas=%s.",
                 min(len(enlaces), MAX_CANDIDATOS), len(ofertas))
+    guardar_ofertas(ofertas)
     return ofertas
 
 
@@ -935,6 +985,36 @@ async def comando_buscar(update, context):
     await ejecutar_busqueda_manual(update, context)
 
 
+async def comando_ultimas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ofertas = obtener_ultimas_ofertas(10)
+    if not ofertas:
+        await update.message.reply_text(
+            "Todavía no tengo ofertas guardadas. Usa /buscar para hacer una búsqueda."
+        )
+        return
+
+    lineas = ["📋 ÚLTIMAS OFERTAS ENCONTRADAS"]
+    for i, (titulo, zona, url, inicio, fin, texto, actualizada) in enumerate(ofertas, 1):
+        fecha = ""
+        if inicio:
+            try:
+                fecha = datetime.fromisoformat(inicio).strftime("%d/%m/%Y")
+            except ValueError:
+                fecha = inicio
+        salario = extraer_salario_anual(texto or "")
+        salario_txt = f"{salario:,} € brutos/año".replace(",", ".") if salario else "sueldo no publicado"
+        lineas.append(
+            f"\n{i}. {titulo}\n📍 {zona or 'Zona no indicada'}"
+            + (f" · 📅 {fecha}" if fecha else "")
+            + f"\n💶 {salario_txt}\n🔗 {url}"
+        )
+
+    respuesta = "\n".join(lineas)
+    for inicio_bloque in range(0, len(respuesta), 3800):
+        await update.message.reply_text(respuesta[inicio_bloque:inicio_bloque + 3800],
+                                        disable_web_page_preview=True)
+
+
 async def comando_portales(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Fuentes gratuitas: Sistema Nacional de Empleo, Indeed, Job Today, Activa San Javier e Interempleo.\n\n"
@@ -971,6 +1051,7 @@ async def comando_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/buscar - Buscar ofertas nuevas\n"
         "/scan - Buscar ofertas nuevas\n"
         "/ofertas - Buscar ofertas nuevas\n"
+        "/ultimas - Ver las últimas ofertas encontradas\n"
         "/portales - Ver fuente\n"        "/diagnostico - Comprobar qué lee cada portal\n"
         "/preferencias - Ver filtros\n"
         "/parar - Desactivar avisos\n"
@@ -1112,6 +1193,7 @@ def main():
     aplicacion.add_handler(CommandHandler("buscar", comando_buscar))
     aplicacion.add_handler(CommandHandler("scan", comando_buscar))
     aplicacion.add_handler(CommandHandler("ofertas", comando_buscar))
+    aplicacion.add_handler(CommandHandler("ultimas", comando_ultimas))
     aplicacion.add_handler(CommandHandler("portales", comando_portales))
     aplicacion.add_handler(CommandHandler("diagnostico", comando_diagnostico))
     aplicacion.add_handler(
