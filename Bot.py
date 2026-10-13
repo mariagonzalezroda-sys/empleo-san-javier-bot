@@ -12,7 +12,7 @@ from urllib.parse import urljoin, urlparse, parse_qs
 from datetime import datetime, date
 from urllib.request import Request, urlopen
 
-from flask import Flask
+from flask import Flask, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -116,6 +116,9 @@ FRASES_NOCHE = [
 
 TAREA_AUTOMATICA = None
 BUSQUEDA_EN_CURSO = False
+APPLICATION = None
+EVENT_LOOP = None
+WEBHOOK_SECRET = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1342,9 +1345,27 @@ async def tarea_automatica(application):
 
 
 async def al_iniciar(application):
-    global TAREA_AUTOMATICA
+    global TAREA_AUTOMATICA, APPLICATION, EVENT_LOOP, WEBHOOK_SECRET
 
-    await application.bot.delete_webhook(drop_pending_updates=False)
+    APPLICATION = application
+    EVENT_LOOP = asyncio.get_running_loop()
+    WEBHOOK_SECRET = hashlib.sha256(
+        (TELEGRAM_TOKEN + ":empleo-san-javier-webhook").encode("utf-8")
+    ).hexdigest()
+
+    url_publica = os.getenv(
+        "RENDER_EXTERNAL_URL",
+        "https://empleo-san-javier-bot.onrender.com",
+    ).rstrip("/")
+    url_webhook = url_publica + "/telegram-webhook"
+
+    # Webhook evita el conflicto de getUpdates durante los despliegues de Render.
+    await application.bot.set_webhook(
+        url=url_webhook,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=False,
+    )
+    logger.info("Webhook de Telegram configurado: %s", url_webhook)
 
     if TAREA_AUTOMATICA is None or TAREA_AUTOMATICA.done():
         TAREA_AUTOMATICA = asyncio.create_task(
@@ -1369,6 +1390,38 @@ def health():
         "estado": "ok",
         "fuente": "Sistema Nacional de Empleo",
     }
+
+
+@web.route("/telegram-webhook", methods=["POST"])
+def recibir_webhook():
+    if APPLICATION is None or EVENT_LOOP is None or WEBHOOK_SECRET is None:
+        return "Bot arrancando", 503
+
+    secreto_recibido = request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token", ""
+    )
+    if secreto_recibido != WEBHOOK_SECRET:
+        return "No autorizado", 403
+
+    try:
+        datos = request.get_json(silent=True)
+        if not isinstance(datos, dict):
+            return "Solicitud inválida", 400
+        actualizacion = Update.de_json(datos, APPLICATION.bot)
+        futuro = asyncio.run_coroutine_threadsafe(
+            APPLICATION.process_update(actualizacion),
+            EVENT_LOOP,
+        )
+        def registrar_error(f):
+            try:
+                f.result()
+            except Exception:
+                logger.exception("Error procesando actualización de Telegram.")
+        futuro.add_done_callback(registrar_error)
+        return "ok", 200
+    except Exception:
+        logger.exception("Error recibiendo webhook de Telegram.")
+        return "Error", 500
 
 
 def iniciar_web():
@@ -1420,7 +1473,24 @@ def main():
     logger.info("Fuente: Sistema Nacional de Empleo.")
     logger.info("Sin créditos de JOA ni API de pago.")
 
-    aplicacion.run_polling(drop_pending_updates=False)
+    async def ejecutar():
+        await aplicacion.initialize()
+        await aplicacion.start()
+        try:
+            # Configura webhook y tarea automática sin activar getUpdates.
+            await al_iniciar(aplicacion)
+            await asyncio.Event().wait()
+        finally:
+            if TAREA_AUTOMATICA is not None:
+                TAREA_AUTOMATICA.cancel()
+                try:
+                    await TAREA_AUTOMATICA
+                except asyncio.CancelledError:
+                    pass
+            await aplicacion.stop()
+            await aplicacion.shutdown()
+
+    asyncio.run(ejecutar())
 
 
 if __name__ == "__main__":
